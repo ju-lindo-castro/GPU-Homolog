@@ -1,8 +1,10 @@
 #!/bin/bash
-# Modulo 0: Orquestrador da Homologacao (v2 - execucao direto do GitHub)
+# Modulo 0: Orquestrador da Homologacao (v3 - execucao direto do GitHub + instalacao do driver com reboot)
 # Executa todos os modulos no fluxo recomendado (mesmo que algum falhe), coleta as metricas e
 # gera o relatorio APROVADO/REPROVADO com um pacote de todos os arquivos da execucao.
 # Se os modulos 01-05 nao estiverem no mesmo diretorio, baixa-os do repositorio GitHub.
+# Se o driver NVIDIA estiver ausente, o Modulo 1 o instala e o servidor e REINICIADO (com aviso);
+# depois do reboot, basta executar o mesmo comando novamente.
 #
 # Uso direto da nuvem (recomendado dentro de tmux/screen: a bateria completa leva varias horas):
 #   curl -fsSL https://raw.githubusercontent.com/ju-lindo-castro/GPU-Homolog/main/00_homologacao.sh | sudo bash -s -- -t <HF_TOKEN>
@@ -21,6 +23,7 @@ EXPECTED_GPUS=8
 EXPECTED_PCIE_GEN=5
 MAX_GPU_TEMP_C=90                         # temperatura maxima aceitavel da GPU no burn-in
 LOAD_UTIL_PCT=50                          # amostras com uso >= este valor contam como "sob carga"
+REBOOT_COUNTDOWN=60                       # segundos de aviso antes do reboot apos instalar o driver
 CRITICAL_XIDS="48 61 62 63 64 74 79 92 94 95 119 120 154"
 
 # Repositorio de onde os modulos sao baixados quando nao estao no mesmo diretorio
@@ -116,7 +119,7 @@ run_stage() {
     log "=================================================="
     log "ETAPA $id: $desc - Iniciada"
     t0=$(date +%s)
-    ( cd "$SCRIPT_DIR" && HOME="$REAL_HOME" HF_TOKEN="$HF_TOKEN_ARG" "$@" ) < /dev/null 2>&1 | tee -a "$ORCH_LOG"
+    ( cd "$SCRIPT_DIR" && HOME="$REAL_HOME" HF_TOKEN="$HF_TOKEN_ARG" HOMOLOG_ORQUESTRADOR=1 "$@" ) < /dev/null 2>&1 | tee -a "$ORCH_LOG"
     rc=${PIPESTATUS[0]}
     ST_DUR[$id]=$(($(date +%s) - t0))
     log "ETAPA $id: $desc - Finalizada (codigo $rc, duracao $(fmt_dur "${ST_DUR[$id]}"))"
@@ -149,6 +152,54 @@ else
     ST_STATUS[1]="APROVADO"
 fi
 while IFS= read -r e; do [ -n "$e" ] && AVISOS+=("Inventario: $e"); done < <(grep -E " - Erro:| - Aviso:" "$INV_LOG" 2>/dev/null | sed -E 's/^\[[^]]*\] //')
+
+# Relatorio curto para execucoes interrompidas antes dos testes (driver pendente ou ausente)
+short_report() {
+    local status="$1" motivo="$2"
+    {
+        echo "=================================================================="
+        echo "RELATORIO DE HOMOLOGACAO - GPU SERVER"
+        echo "=================================================================="
+        echo "Host:      $HOST"
+        echo "Servidor:  $(dmidecode -s system-manufacturer 2>/dev/null | head -n1) $(dmidecode -s system-product-name 2>/dev/null | head -n1) | Serial: $(dmidecode -s system-serial-number 2>/dev/null | head -n1)"
+        echo "Data:      $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "GPUs NVIDIA no barramento PCIe (lspci): $(lspci -d 10de: -nn 2>/dev/null | grep -cE "\[(0300|0302)\]")"
+        echo ""
+        echo ">>> RESULTADO: $status <<<"
+        echo "  - $motivo"
+        echo ""
+        echo "Ultimas linhas do inventario:"
+        tail -n 15 "$INV_LOG" 2>/dev/null | sed -E 's/^\[[^]]*\] /  /'
+        echo "=================================================================="
+    } > "$REPORT"
+    cat "$REPORT" | tee -a "$ORCH_LOG"
+    chown -R "$REAL_USER": "$BASE_DIR" 2>/dev/null
+    log "Relatorio: $REPORT"
+}
+
+# Driver NVIDIA recem-instalado pelo Modulo 1: avisa e reinicia o servidor
+if [ "$RC" -eq 4 ]; then
+    short_report "PENDENTE - REBOOT NECESSARIO" "O driver NVIDIA foi instalado e so funciona apos reiniciar. Depois do reboot, execute novamente o mesmo comando."
+    log "=================================================================="
+    log "ATENCAO: o servidor sera REINICIADO em ${REBOOT_COUNTDOWN}s para carregar o driver NVIDIA. Pressione Ctrl+C para cancelar."
+    log "Depois do reboot, execute novamente o MESMO comando para continuar a homologacao."
+    log "=================================================================="
+    sleep "$REBOOT_COUNTDOWN"
+    log "Reiniciando o servidor..."
+    reboot
+    exit 4
+fi
+
+# Sem driver funcional nenhum teste pode rodar: encerra com a causa real, em vez de reprovacoes enganosas
+if ! command -v nvidia-smi &> /dev/null || ! timeout 30 nvidia-smi -L &> /dev/null; then
+    if ! command -v nvidia-smi &> /dev/null; then
+        short_report "NAO EXECUTADO" "Driver NVIDIA ausente e a instalacao automatica falhou (ver inventario). Os testes nao foram executados."
+    else
+        short_report "NAO EXECUTADO" "O driver NVIDIA esta instalado, mas o nvidia-smi nao responde (driver nao carregado ou GPU inacessivel). Verifique o log do inventario e o dmesg."
+    fi
+    rm -f "$STAMP"
+    exit 1
+fi
 
 # ==============================================================================
 # Etapa 2: Telemetria (inicio)

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Modulo 4: Telemetria em Background - Versao Universal (v9 - start/stop/status, log de kernel continuo, timeout e metricas estendidas)
+# Modulo 4: Telemetria em Background - Versao Universal (v10 - start/stop/status, log de kernel continuo, timeout, metricas estendidas e deteccao de driver ausente)
 # Uso: ./04_telemetria.sh start | stop | status
 
 # Garante execucao como root: necessario para ler o dmesg (Ubuntu restringe a usuarios comuns)
@@ -65,6 +65,8 @@ run_collector() {
             while IFS= read -r line; do
                 echo "$ts,$line" >> "$csv"
             done <<< "$out"
+        elif [ "$rc" -eq 127 ]; then
+            echo "[$ts] [telemetria] ERRO: nvidia-smi nao encontrado (driver NVIDIA ausente ou removido)." >> "$klog"
         elif [ "$rc" -eq 124 ]; then
             echo "[$ts] [telemetria] ALERTA: nvidia-smi nao respondeu em 10s (possivel GPU travada ou caida do barramento)." >> "$klog"
         else
@@ -79,6 +81,10 @@ run_collector() {
 # Comandos
 # ==============================================================================
 cmd_start() {
+    if ! command -v nvidia-smi &> /dev/null; then
+        echo "ERRO: nvidia-smi nao encontrado - o driver NVIDIA nao esta instalado. Execute o Modulo 1 (instala o driver)."
+        exit 1
+    fi
     if is_running; then
         echo "Telemetria ja esta em execucao (PID $(cat "$PID_FILE")). Use '$0 stop' antes de iniciar outra."
         exit 1

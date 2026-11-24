@@ -1,5 +1,6 @@
 #!/bin/bash
-# Modulo 1: Inventario e Preparacao do Ambiente (v11 - DCGM 4, CUDA/NCCL alinhados ao driver, Docker/NVIDIA Container Toolkit, Auditoria PCIe e de GPUs)
+# Modulo 1: Inventario e Preparacao do Ambiente (v12 - Driver NVIDIA automatico, DCGM 4, CUDA/NCCL alinhados ao driver, Docker/NVIDIA Container Toolkit, Auditoria PCIe e de GPUs)
+# Codigos de saida: 0 = concluido | 1 = falha critica | 4 = driver NVIDIA instalado, reboot necessario
 
 BASE_DIR="$HOME/homologacao"
 mkdir -p "$BASE_DIR"/{inventario,dcgm,stress,benchmark,logs}
@@ -14,7 +15,7 @@ log() {
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-log "--- Iniciando Script de Inventario (v11) ---"
+log "--- Iniciando Script de Inventario (v12) ---"
 
 # 0. Correcao para imagens limpas (Minimal/Server) do Ubuntu
 log "Etapa: Preparacao base do sistema (apt-utils e correcao Java/Manpages) - Iniciado"
@@ -55,15 +56,7 @@ check_and_install "curl" "curl"
 check_and_install "lspci" "pciutils"
 check_and_install "ipmitool" "ipmitool"
 check_and_install "lscpu" "util-linux"
-
-log "Etapa: Verificacao NVIDIA Driver (nvidia-smi) - Iniciado"
-if ! command -v nvidia-smi &> /dev/null; then
-    log "Etapa: Verificacao NVIDIA Driver (nvidia-smi) - Erro: Comando nao encontrado!"
-    log "Falha Critica: O driver NVIDIA precisa ser instalado manualmente e o servidor reiniciado. Abortando."
-    exit 1
-else
-    log "Etapa: Verificacao NVIDIA Driver (nvidia-smi) - Finalizado"
-fi
+check_and_install "dmidecode" "dmidecode"
 
 # ==============================================================================
 # Repositorio oficial NVIDIA (CUDA) - usado pelo CUDA Toolkit, NCCL e DCGM
@@ -81,6 +74,65 @@ else
         log "Etapa: Repositorio NVIDIA CUDA (cuda-keyring) - Erro: Falha ao configurar o repositorio para '$distribution'."
     fi
 fi
+
+# ==============================================================================
+# Driver NVIDIA: instalado automaticamente (open kernel modules) quando ausente.
+# Codigo de saida 4 = driver instalado ou pendente: REBOOT necessario.
+# ==============================================================================
+DRIVER_PIN=""          # opcional: fixa um branch do driver (ex.: 580); vazio = mais recente do repositorio
+REBOOT_COUNTDOWN=60    # segundos de aviso antes do reboot (Ctrl+C cancela)
+
+request_reboot() {
+    log "=================================================================="
+    log "REBOOT NECESSARIO: $1"
+    log "Depois que o servidor voltar, execute novamente o MESMO comando para continuar a homologacao."
+    log "=================================================================="
+    if [ -n "$HOMOLOG_ORQUESTRADOR" ]; then
+        exit 4   # o orquestrador registra o relatorio e faz o reboot
+    fi
+    log "ATENCAO: o servidor sera REINICIADO em ${REBOOT_COUNTDOWN}s. Pressione Ctrl+C para cancelar."
+    sleep "$REBOOT_COUNTDOWN" && sudo reboot
+    exit 4
+}
+
+log "Etapa: Verificacao NVIDIA Driver (nvidia-smi) - Iniciado"
+PCI_NV=$(lspci -d 10de: -nn 2>/dev/null | grep -cE "\[(0300|0302)\]" || true)
+if command -v nvidia-smi &> /dev/null && timeout 30 nvidia-smi -L &> /dev/null; then
+    log "Etapa: Verificacao NVIDIA Driver (nvidia-smi) - Finalizado (driver $(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1))"
+elif command -v nvidia-smi &> /dev/null && dpkg -s nvidia-open &> /dev/null && [ ! -e /proc/driver/nvidia/version ]; then
+    # Driver instalado (provavelmente pelo proprio script) mas modulo do kernel ainda nao carregado
+    log "Etapa: Verificacao NVIDIA Driver (nvidia-smi) - Aviso: driver instalado, mas o modulo do kernel nao esta carregado."
+    request_reboot "o driver NVIDIA esta instalado, mas so passa a funcionar apos reiniciar o servidor."
+elif command -v nvidia-smi &> /dev/null; then
+    # Driver carregado mas sem resposta: possivel GPU caida, tratado pela auditoria e pelo Modulo 2
+    ERR=$(timeout 30 nvidia-smi -L 2>&1 | tr '\n' ' ' | head -c 200)
+    log "Etapa: Verificacao NVIDIA Driver (nvidia-smi) - Erro: driver instalado, mas o nvidia-smi falhou: $ERR"
+else
+    log "Etapa: Verificacao NVIDIA Driver (nvidia-smi) - Ausente. $PCI_NV GPU(s) NVIDIA no barramento PCIe."
+    if [ "$PCI_NV" -eq 0 ]; then
+        log "Falha Critica: nenhuma GPU NVIDIA encontrada no barramento PCIe. Abortando."
+        exit 1
+    fi
+    if command -v mokutil &> /dev/null && mokutil --sb-state 2>/dev/null | grep -qi "enabled"; then
+        log "AVISO: Secure Boot habilitado. O modulo do driver pode nao carregar sem cadastrar a chave MOK; se isso ocorrer, desabilite o Secure Boot na BIOS."
+    fi
+    log "Etapa: Instalacao do driver NVIDIA (open kernel modules) - Iniciado"
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "linux-headers-$(uname -r)" &>/tmp/err_driver_install.log || true
+    if [ -n "$DRIVER_PIN" ]; then
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "nvidia-driver-pinning-$DRIVER_PIN" &>>/tmp/err_driver_install.log \
+            || log "Etapa: Instalacao do driver NVIDIA - Aviso: nao foi possivel fixar o branch $DRIVER_PIN."
+    fi
+    if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nvidia-open &>>/tmp/err_driver_install.log; then
+        log "Etapa: Instalacao do driver NVIDIA (open kernel modules) - Finalizado (instalado com sucesso)"
+        request_reboot "o driver NVIDIA acabou de ser instalado e so passa a funcionar apos reiniciar o servidor."
+    else
+        ERR=$(tr '\n' ' ' < /tmp/err_driver_install.log | tail -c 250)
+        log "Etapa: Instalacao do driver NVIDIA (open kernel modules) - Erro: $ERR"
+        log "Falha Critica: nao foi possivel instalar o driver NVIDIA automaticamente. Instale-o manualmente e reinicie o servidor. Abortando."
+        exit 1
+    fi
+fi
+
 
 # ==============================================================================
 # CUDA Toolkit (versao alinhada ao driver; minimo 12.8 para Blackwell) + NCCL

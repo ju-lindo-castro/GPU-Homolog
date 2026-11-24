@@ -17,11 +17,11 @@ Ao final, o orquestrador gera um relatório **APROVADO / REPROVADO** com os moti
 
 1. Ubuntu 24.04 (recomendado), x86_64.
 2. Acesso root ou sudo.
-3. Driver proprietário NVIDIA instalado (`nvidia-smi` funcional), com suporte a **CUDA 12.8 ou superior** (exigência da arquitetura Blackwell).
+3. Driver NVIDIA: **se não estiver instalado, o Módulo 1 instala automaticamente** o driver com open kernel modules (`nvidia-open`, do repositório oficial da NVIDIA) e **reinicia o servidor**, com aviso de 60 segundos (Ctrl+C cancela). Um driver já instalado precisa suportar **CUDA 12.8 ou superior**, a exigência da arquitetura Blackwell.
 4. Token do Hugging Face com permissão *Read*, em uma conta que tenha aceitado a licença do modelo `meta-llama/Llama-3.3-70B-Instruct`.
 5. Acesso à internet: repositórios apt (Ubuntu, NVIDIA CUDA, NVIDIA Container Toolkit), GitHub, Docker Hub e Hugging Face.
 
-Todo o restante (CUDA Toolkit, NCCL, DCGM 4, Docker, NVIDIA Container Toolkit, jq etc.) é instalado automaticamente pelo Módulo 1.
+Todo o restante (driver NVIDIA, CUDA Toolkit, NCCL, DCGM 4, Docker, NVIDIA Container Toolkit, jq, dmidecode etc.) é instalado automaticamente pelo Módulo 1.
 
 ---
 
@@ -43,6 +43,8 @@ mkdir -p ~/GPU-Homolog && curl -fsSL https://github.com/ju-lindo-castro/GPU-Homo
 ```
 
 Os scripts ficam em `~/GPU-Homolog`; rodar o comando de novo atualiza os scripts para a versão mais recente do repositório. Os resultados ficam em `~/homologacao/relatorios/`.
+
+> **Servidor sem driver NVIDIA:** a primeira execução instala o driver e **reinicia o servidor automaticamente**, com aviso de 60 segundos (Ctrl+C cancela). Depois do reboot, abra a sessão tmux e execute o **mesmo comando** de novo para rodar a homologação.
 
 **Para voltar à sessão depois de desconectar:**
 
@@ -109,9 +111,11 @@ Arquivos gerados em `~/homologacao/relatorios/`:
 
 | Arquivo | Conteúdo |
 |---|---|
-| `relatorio_<host>_<data>.txt` | Veredito e motivos, status e duração de cada etapa, resumo de cada teste, tabela térmica por GPU, versões de software, fabricante, modelo, serial e BIOS do servidor |
+| `relatorio_<host>_<data>.txt` | Resultado (APROVADO, REPROVADO, PENDENTE - REBOOT NECESSÁRIO ou NÃO EXECUTADO) e motivos, status e duração de cada etapa, resumo de cada teste, tabela térmica por GPU, versões de software, fabricante, modelo, serial e BIOS do servidor |
 | `homologacao_<host>_<data>.tar.gz` | Todos os arquivos gerados na execução (sem o dataset e sem o código do nccl-tests) |
 | `00_orquestrador_<host>_<data>.log` | Saída completa de todos os módulos |
+
+Se o Módulo 1 instalar o driver, o orquestrador grava um relatório **PENDENTE - REBOOT NECESSÁRIO**, avisa e reinicia o servidor. Se o driver estiver ausente e a instalação falhar, ou se o driver não responder, o resultado é **NÃO EXECUTADO** com a causa real: os demais testes não rodam, para não gerar reprovações enganosas.
 
 ### Opção 2 — Manual (módulo a módulo)
 
@@ -149,6 +153,7 @@ Ficam **apenas registrados**, sem reprovar: o throughput do vLLM, a banda do NCC
 
 ### Módulo 1 — Inventário e preparação do ambiente
 
+- Se o **driver NVIDIA** estiver ausente, instala o `nvidia-open` (com os headers do kernel) e pede reboot, com código de saída `4`. Rodando sozinho, o próprio módulo avisa e reinicia o servidor em 60 segundos. Avisa se o Secure Boot estiver habilitado, porque ele pode impedir o carregamento do módulo do driver.
 - Configura o repositório oficial NVIDIA CUDA e instala o **CUDA Toolkit** e a **NCCL** na versão alinhada ao CUDA suportado pelo driver (mínimo 12.8). Remove o `nvidia-cuda-toolkit` do Ubuntu, que não suporta Blackwell.
 - Instala o **DCGM 4** (`datacenter-gpu-manager-4-cuda<major>`), migrando automaticamente do DCGM 3.x.
 - Instala o **Docker** e o **NVIDIA Container Toolkit** (versão fixa `1.20.2-1`) e confirma que um container enxerga as 8 GPUs.
@@ -218,6 +223,7 @@ Ficam **apenas registrados**, sem reprovar: o throughput do vLLM, a banda do NCC
 | `1` | Erro de software ou de execução (teste incompleto) |
 | `2` | GPU caiu do barramento (reboot físico obrigatório). Usado pelo Módulo 2. |
 | `3` | Hardware reprovado |
+| `4` | Driver NVIDIA instalado: reboot necessário. Usado pelos Módulos 0 e 1. |
 
 ---
 
@@ -229,6 +235,8 @@ Constantes no início de cada script:
 |---|---|---|---|
 | `EXPECTED_GPUS` | 00, 01, 02 | `8` | Quantidade de GPUs esperada |
 | `EXPECTED_PCIE_GEN` / `EXPECTED_PCIE_WIDTH` | 01 (`GEN` também em 00) | `5` / `16` | Link PCIe esperado |
+| `DRIVER_PIN` | 01 | vazio | Branch do driver NVIDIA a fixar na instalação automática (vazio = mais recente) |
+| `REBOOT_COUNTDOWN` | 00, 01 | `60` | Segundos de aviso antes do reboot após instalar o driver |
 | `MIN_CUDA_VERSION` | 01 | `12.8` | CUDA mínimo suportado pelo driver |
 | `NVIDIA_CTK_VERSION` | 01 | `1.20.2-1` | Versão do NVIDIA Container Toolkit |
 | `MAX_GPU_TEMP_C` | 00 | `90` | Temperatura máxima aceitável no burn-in |

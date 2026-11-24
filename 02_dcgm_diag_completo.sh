@@ -1,5 +1,5 @@
 #!/bin/bash
-# Modulo 2: Diagnostico DCGM Completo (v9 - Gatekeeper de Saude PCIe/Hardware + Execucao como root + Avaliacao do JSON FAIL/WARN)
+# Modulo 2: Diagnostico DCGM Completo (v10 - Gatekeeper de Saude PCIe/Hardware + Execucao como root + Avaliacao do JSON FAIL/WARN + deteccao de driver ausente)
 # Uso: ./02_dcgm_diag_completo.sh [NIVEL_MAXIMO] (Padrao: 4. Ex: ./02_dcgm_diag_completo.sh 2)
 # Codigos de saida: 0 = aprovado | 1 = erro de software/utilitario | 2 = GPU caiu (reboot obrigatorio) | 3 = hardware reprovado no diagnostico
 
@@ -181,7 +181,14 @@ evaluate_dcgm_json() {
 
 log "--- Iniciando Diagnostico DCGM Sequencial (Niveis 1 a $MAX_LEVEL) ---"
 
-# Passo 0: Verifica se o hardware ja nao esta degradado antes mesmo de tocar no DCGM
+# Passo 0a: Sem driver nao ha o que diagnosticar (nao confundir com GPU caida do barramento)
+if ! command -v nvidia-smi &> /dev/null; then
+    log "ERRO DE SOFTWARE: nvidia-smi nao encontrado - o driver NVIDIA nao esta instalado."
+    log "Execute o Modulo 1 (instala o driver automaticamente). Nao e necessario reboot fisico por este motivo."
+    exit 1
+fi
+
+# Passo 0b: Verifica se o hardware ja nao esta degradado antes mesmo de tocar no DCGM
 if ! check_gpu_health "Pre-Check Inicial"; then
     exit 2
 fi
