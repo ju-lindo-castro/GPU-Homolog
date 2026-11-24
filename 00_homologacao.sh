@@ -1,10 +1,17 @@
 #!/bin/bash
-# Modulo 0: Orquestrador da Homologacao (v1)
+# Modulo 0: Orquestrador da Homologacao (v2 - execucao direto do GitHub)
 # Executa todos os modulos no fluxo recomendado (mesmo que algum falhe), coleta as metricas e
 # gera o relatorio APROVADO/REPROVADO com um pacote de todos os arquivos da execucao.
+# Se os modulos 01-05 nao estiverem no mesmo diretorio, baixa-os do repositorio GitHub.
 #
-# Uso: ./00_homologacao.sh -t <HF_TOKEN>
-# Recomendado rodar dentro de tmux/screen: a bateria completa leva varias horas.
+# Uso direto da nuvem (recomendado dentro de tmux/screen: a bateria completa leva varias horas):
+#   curl -fsSL https://raw.githubusercontent.com/ju-lindo-castro/GPU-Homolog/main/00_homologacao.sh | sudo bash -s -- -t <HF_TOKEN>
+# Uso local:
+#   ./00_homologacao.sh -t <HF_TOKEN> [-b <branch/tag>]
+
+# Todo o script fica dentro deste bloco: o bash le o arquivo inteiro antes de executar,
+# o que torna seguro rodar via "curl ... | sudo bash"
+{
 
 # ==============================================================================
 # Configuracao
@@ -16,12 +23,18 @@ MAX_GPU_TEMP_C=90                         # temperatura maxima aceitavel da GPU 
 LOAD_UTIL_PCT=50                          # amostras com uso >= este valor contam como "sob carga"
 CRITICAL_XIDS="48 61 62 63 64 74 79 92 94 95 119 120 154"
 
-usage() { echo "Uso: $0 -t <HF_TOKEN>"; exit 1; }
+# Repositorio de onde os modulos sao baixados quando nao estao no mesmo diretorio
+REPO_RAW="${GPU_HOMOLOG_RAW:-https://raw.githubusercontent.com/ju-lindo-castro/GPU-Homolog}"
+REPO_REF="main"
+MODULES="01_inventario.sh 02_dcgm_diag_completo.sh 03_nccl_test.sh 04_telemetria.sh 05_vllm_benchmark.sh"
+
+usage() { echo "Uso: 00_homologacao.sh -t <HF_TOKEN> [-b <branch/tag>]"; exit 1; }
 
 HF_TOKEN_ARG=""
-while getopts ":t:h" opt; do
+while getopts ":t:b:h" opt; do
     case "$opt" in
         t) HF_TOKEN_ARG="$OPTARG" ;;
+        b) REPO_REF="$OPTARG" ;;
         *) usage ;;
     esac
 done
@@ -32,7 +45,11 @@ fi
 
 # Roda como root do comeco ao fim (sem depender do cache do sudo durante horas)
 if [ "$EUID" -ne 0 ]; then
-    exec sudo "$0" "$@"
+    if [ -f "$0" ]; then
+        exec sudo "$0" "$@"
+    fi
+    echo "ERRO: execute como root. Exemplo: curl -fsSL $REPO_RAW/$REPO_REF/00_homologacao.sh | sudo bash -s -- -t <HF_TOKEN>"
+    exit 1
 fi
 
 # Garante USER definido (pode vir vazio em cron/ambientes minimos); os modulos 2 e 4 tambem dependem dele
@@ -40,7 +57,6 @@ export USER="${USER:-$(id -un)}"
 REAL_USER="${SUDO_USER:-$USER}"
 REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 BASE_DIR="$REAL_HOME/homologacao"
-SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 HOST=$(hostname)
 TS=$(date +%Y%m%d_%H%M%S)
 REPORT_DIR="$BASE_DIR/relatorios"
@@ -56,12 +72,34 @@ fmt_dur() { printf '%02d:%02d:%02d' $(($1 / 3600)) $(($1 % 3600 / 60)) $(($1 % 6
 # Arquivo mais recente de um padrao, gerado nesta execucao
 newest() { find "$1" -maxdepth 1 -name "$2" -newer "$STAMP" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n1 | cut -d' ' -f2-; }
 
-for m in 01_inventario.sh 02_dcgm_diag_completo.sh 03_nccl_test.sh 04_telemetria.sh 05_vllm_benchmark.sh; do
-    if [ ! -x "$SCRIPT_DIR/$m" ]; then
-        echo "ERRO: $SCRIPT_DIR/$m ausente ou sem permissao de execucao."
-        exit 1
-    fi
-done
+# ==============================================================================
+# Localiza os modulos: mesmo diretorio do orquestrador ou download do GitHub
+# ==============================================================================
+SCRIPT_DIR=""
+if [ -f "$0" ]; then
+    SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+    for m in $MODULES; do [ -f "$SCRIPT_DIR/$m" ] || SCRIPT_DIR=""; done
+fi
+if [ -n "$SCRIPT_DIR" ]; then
+    chmod +x "$SCRIPT_DIR"/0[1-5]_*.sh 2>/dev/null
+    log "Modulos locais encontrados em $SCRIPT_DIR"
+else
+    SCRIPT_DIR="$BASE_DIR/scripts"
+    mkdir -p "$SCRIPT_DIR"
+    log "Baixando os modulos de $REPO_RAW/$REPO_REF para $SCRIPT_DIR ..."
+    for m in $MODULES; do
+        if curl -fsSL --retry 3 "$REPO_RAW/$REPO_REF/$m" -o "$SCRIPT_DIR/$m.tmp" 2>>"$ORCH_LOG" \
+            || wget -q --tries=3 "$REPO_RAW/$REPO_REF/$m" -O "$SCRIPT_DIR/$m.tmp" 2>>"$ORCH_LOG"; then
+            mv "$SCRIPT_DIR/$m.tmp" "$SCRIPT_DIR/$m"
+            chmod +x "$SCRIPT_DIR/$m"
+            log "  $m baixado."
+        else
+            rm -f "$SCRIPT_DIR/$m.tmp"
+            log "ERRO: nao foi possivel baixar $m de $REPO_RAW/$REPO_REF (repositorio privado ou sem acesso a internet?)."
+            exit 1
+        fi
+    done
+fi
 
 declare -A ST_STATUS ST_DUR ST_DESC
 STAGES=()
@@ -78,7 +116,7 @@ run_stage() {
     log "=================================================="
     log "ETAPA $id: $desc - Iniciada"
     t0=$(date +%s)
-    ( cd "$SCRIPT_DIR" && HOME="$REAL_HOME" HF_TOKEN="$HF_TOKEN_ARG" "$@" ) 2>&1 | tee -a "$ORCH_LOG"
+    ( cd "$SCRIPT_DIR" && HOME="$REAL_HOME" HF_TOKEN="$HF_TOKEN_ARG" "$@" ) < /dev/null 2>&1 | tee -a "$ORCH_LOG"
     rc=${PIPESTATUS[0]}
     ST_DUR[$id]=$(($(date +%s) - t0))
     log "ETAPA $id: $desc - Finalizada (codigo $rc, duracao $(fmt_dur "${ST_DUR[$id]}"))"
@@ -364,3 +402,4 @@ log "Relatorio: $REPORT"
 log "Pacote com todos os arquivos: $TARBALL"
 log "--- Homologacao concluida: $VERDICT ---"
 [ "$VERDICT" = "APROVADO" ] && exit 0 || exit 3
+}

@@ -25,19 +25,49 @@ Todo o restante (CUDA Toolkit, NCCL, DCGM 4, Docker, NVIDIA Container Toolkit, j
 
 ---
 
-## Início rápido
+## Início rápido (copiar e colar)
+
+> O repositório precisa estar **público** para o download funcionar sem autenticação.
+> A bateria completa leva várias horas: abra uma sessão `tmux` antes, para que a execução continue mesmo se a conexão SSH cair.
+
+**1. Abra uma sessão tmux:**
 
 ```bash
-git clone https://github.com/ju-lindo-castro/GPU-Homolog.git
-cd GPU-Homolog
-chmod +x *.sh
-
-# A bateria completa leva várias horas: rode dentro de tmux ou screen
 tmux new -s homologacao
-./00_homologacao.sh -t <HF_TOKEN>
 ```
 
-Os resultados ficam em `~/homologacao/relatorios/`.
+**2. Baixe, extraia e execute (troque `<HF_TOKEN>` pelo token do Hugging Face):**
+
+```bash
+mkdir -p ~/GPU-Homolog && curl -fsSL https://github.com/ju-lindo-castro/GPU-Homolog/archive/refs/heads/main.tar.gz | tar -xz -C ~/GPU-Homolog --strip-components=1 && cd ~/GPU-Homolog && chmod +x *.sh && ./00_homologacao.sh -t <HF_TOKEN>
+```
+
+Os scripts ficam em `~/GPU-Homolog`; rodar o comando de novo atualiza os scripts para a versão mais recente do repositório. Os resultados ficam em `~/homologacao/relatorios/`.
+
+**Para voltar à sessão depois de desconectar:**
+
+```bash
+tmux attach -t homologacao
+```
+
+<details>
+<summary>Alternativas: pacote .zip ou execução direta sem baixar o pacote</summary>
+
+**Com o pacote .zip** (instala o `unzip`, se necessário):
+
+```bash
+sudo apt-get install -y unzip && cd ~ && wget -q https://github.com/ju-lindo-castro/GPU-Homolog/archive/refs/heads/main.zip -O GPU-Homolog.zip && rm -rf /tmp/gpu-homolog-zip ~/GPU-Homolog && unzip -q -o GPU-Homolog.zip -d /tmp/gpu-homolog-zip && mv /tmp/gpu-homolog-zip/*/ ~/GPU-Homolog && rm -rf /tmp/gpu-homolog-zip GPU-Homolog.zip && cd ~/GPU-Homolog && chmod +x *.sh && ./00_homologacao.sh -t <HF_TOKEN>
+```
+
+**Direto do GitHub, sem baixar o pacote** (o orquestrador baixa os demais módulos para `~/homologacao/scripts`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ju-lindo-castro/GPU-Homolog/main/00_homologacao.sh | sudo bash -s -- -t <HF_TOKEN>
+```
+
+**Uma versão específica** (branch ou tag), em vez da `main`: troque `main` pelo nome da versão nas URLs acima. No modo direto, use também `-b <versao>` no final do comando.
+
+</details>
 
 ---
 
@@ -52,7 +82,7 @@ Os resultados ficam em `~/homologacao/relatorios/`.
 | `04_telemetria.sh` | 4 · Telemetria | Coleta em background de temperatura, energia, clocks, PCIe, ECC e log do kernel |
 | `05_vllm_benchmark.sh` | 5 · vLLM | Benchmark de inferência com Llama 3.3 70B (TP=8) |
 
-Todos os scripts devem ficar no mesmo diretório.
+Os scripts devem ficar no mesmo diretório. Se o orquestrador for executado sozinho, ele baixa os módulos 01 a 05 do GitHub automaticamente.
 
 ---
 
@@ -60,8 +90,10 @@ Todos os scripts devem ficar no mesmo diretório.
 
 ### Opção 1 — Automatizada (recomendada)
 
+Use o comando do [Início rápido](#início-rápido-copiar-e-colar). Com os scripts já baixados, basta:
+
 ```bash
-./00_homologacao.sh -t <HF_TOKEN>
+cd ~/GPU-Homolog && ./00_homologacao.sh -t <HF_TOKEN>
 ```
 
 O orquestrador roda como root do começo ao fim e executa **todos os módulos, mesmo que algum falhe**. Em um host com problema relatado pelo cliente, todas as evidências são importantes. A sequência é:
