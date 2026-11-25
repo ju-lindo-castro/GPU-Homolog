@@ -1,6 +1,6 @@
 # GPU Homolog
 
-Protocolo automatizado de homologação, diagnóstico e benchmark para servidores de IA com múltiplas GPUs NVIDIA (referência: Dell PowerEdge XE7745 com 8× NVIDIA RTX PRO 6000 Blackwell).
+Protocolo automatizado de homologação, diagnóstico e benchmark para servidores de IA com múltiplas GPUs NVIDIA. Referência: Dell PowerEdge XE7745 com 8× NVIDIA RTX PRO 6000 Blackwell. Também funciona com outros modelos, como Supermicro AS-4125GS-TNRT com 8× NVIDIA L40S.
 
 A bateria de testes verifica:
 
@@ -136,11 +136,11 @@ O servidor é **REPROVADO** se ocorrer qualquer um dos itens abaixo.
 
 | Origem | Critério |
 |---|---|
-| Inventário | Menos de 8 GPUs no PCIe ou no driver; GPU com link abaixo de Gen5 x16; GPU pendente de reboot (*Recovery Action*); container Docker sem acesso às 8 GPUs |
+| Inventário | Menos de 8 GPUs no PCIe ou no driver; GPU com link PCIe abaixo da geração máxima suportada pela própria GPU (ex.: L40S = Gen4, RTX PRO 6000 Blackwell = Gen5) ou com largura menor que x16; GPU pendente de reboot (*Recovery Action*); container Docker sem acesso às 8 GPUs |
 | DCGM | Qualquer teste com `FAIL`; qualquer `WARN` maligno (ECC, Xid, throttling, PCIe, energia, desempenho abaixo do limite ou aviso não catalogado); GPU caiu do barramento |
 | NCCL | Corrupção de dados (`#wrong` ≠ 0 ou `Out of bounds values` ≠ 0) em qualquer rodada; teste incompleto; banda abaixo de `MIN_BUSBW_GBPS` (se definido) |
 | vLLM | Falha na execução do benchmark |
-| Telemetria | GPU acima de **90 °C**; throttling térmico, HW Slowdown ou Power Brake; GPU que não atinge PCIe Gen5 sob carga; erros ECC não corrigidos; `nvidia-smi` sem resposta |
+| Telemetria | GPU acima de **90 °C**; throttling térmico, HW Slowdown ou Power Brake; GPU que não atinge, sob carga, a geração PCIe máxima que ela suporta; erros ECC não corrigidos; `nvidia-smi` sem resposta |
 | Kernel | Xid crítico (48, 61, 62, 63, 64, 74, 79, 92, 94, 95, 119, 120, 154) ou *GPU has fallen off the bus* |
 
 Ficam **apenas registrados**, sem reprovar: o throughput do vLLM, a banda do NCCL (enquanto `MIN_BUSBW_GBPS=0`), a indisponibilidade de P2P, os avisos benignos do DCGM (Persistence Mode, recurso não suportado, modo MIG) e os Xids não críticos.
@@ -158,7 +158,7 @@ Ficam **apenas registrados**, sem reprovar: o throughput do vLLM, a banda do NCC
 - Instala o **DCGM 4** (`datacenter-gpu-manager-4-cuda<major>`), migrando automaticamente do DCGM 3.x.
 - Instala o **Docker** e o **NVIDIA Container Toolkit** (versão fixa `1.20.2-1`) e confirma que um container enxerga as 8 GPUs.
 - Coleta o inventário: `nvidia-smi -q`, topologia, PCIe, CPU, memória, discos, `lspci`, IPMI SEL e versões de software.
-- Audita a quantidade de GPUs (`EXPECTED_GPUS=8`), o link PCIe de cada GPU (Gen5 x16) e o estado de *Recovery Action*.
+- Audita a quantidade de GPUs (`EXPECTED_GPUS=8`), o link PCIe de cada GPU (geração máxima suportada pela própria GPU, largura x16) e o estado de *Recovery Action*.
 
 ### Módulo 2 — Diagnóstico DCGM
 
@@ -234,7 +234,7 @@ Constantes no início de cada script:
 | Constante | Arquivo | Padrão | Descrição |
 |---|---|---|---|
 | `EXPECTED_GPUS` | 00, 01, 02 | `8` | Quantidade de GPUs esperada |
-| `EXPECTED_PCIE_GEN` / `EXPECTED_PCIE_WIDTH` | 01 (`GEN` também em 00) | `5` / `16` | Link PCIe esperado |
+| `EXPECTED_PCIE_GEN` / `EXPECTED_PCIE_WIDTH` | 01 (`GEN` também em 00) | `5` / `16` | Largura PCIe esperada. A geração esperada vem do máximo informado pela própria GPU; `EXPECTED_PCIE_GEN` só é usado se o driver não informar esse máximo. |
 | `DRIVER_PIN` | 01 | vazio | Branch do driver NVIDIA a fixar na instalação automática (vazio = mais recente) |
 | `REBOOT_COUNTDOWN` | 00, 01 | `60` | Segundos de aviso antes do reboot após instalar o driver |
 | `MIN_CUDA_VERSION` | 01 | `12.8` | CUDA mínimo suportado pelo driver |

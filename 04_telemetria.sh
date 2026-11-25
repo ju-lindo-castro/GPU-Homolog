@@ -51,7 +51,7 @@ run_collector() {
     echo "timestamp,$fields" > "$csv"
 
     # Coletor continuo do log do kernel: acrescenta cada evento (nunca sobrescreve)
-    ( dmesg -wT 2>&1 | grep --line-buffered -iE "NVRM|Xid|PCIe Bus Error|GPU has fallen off the bus|AER" >> "$klog" ) &
+    ( dmesg -wT 2>&1 | grep --line-buffered -iE "NVRM|Xid|PCIe Bus Error|GPU has fallen off the bus|AER:" >> "$klog" ) &
     kpid=$!
 
     # Encerramento limpo ao receber TERM/INT (enviado pelo 'stop')

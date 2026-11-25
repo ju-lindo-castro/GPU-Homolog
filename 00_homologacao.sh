@@ -1,5 +1,5 @@
 #!/bin/bash
-# Modulo 0: Orquestrador da Homologacao (v3 - execucao direto do GitHub + instalacao do driver com reboot)
+# Modulo 0: Orquestrador da Homologacao (v4 - execucao direto do GitHub + instalacao do driver com reboot + PCIe pelo maximo da GPU)
 # Executa todos os modulos no fluxo recomendado (mesmo que algum falhe), coleta as metricas e
 # gera o relatorio APROVADO/REPROVADO com um pacote de todos os arquivos da execucao.
 # Se os modulos 01-05 nao estiverem no mesmo diretorio, baixa-os do repositorio GitHub.
@@ -20,7 +20,7 @@
 # ==============================================================================
 DCGM_LEVEL=4
 EXPECTED_GPUS=8
-EXPECTED_PCIE_GEN=5
+EXPECTED_PCIE_GEN=5                       # usado so se o driver nao informar a geracao maxima de cada GPU
 MAX_GPU_TEMP_C=90                         # temperatura maxima aceitavel da GPU no burn-in
 LOAD_UTIL_PCT=50                          # amostras com uso >= este valor contam como "sob carga"
 REBOOT_COUNTDOWN=60                       # segundos de aviso antes do reboot apos instalar o driver
@@ -298,6 +298,11 @@ if [ "$TELEMETRY_ON" = true ]; then
     if [ -z "$TEL_TABLE" ]; then
         ST_STATUS[6]="FALHOU"; MOTIVOS+=("Telemetria: nenhuma amostra coletada; burn-in nao verificado.")
     fi
+    # Geracao PCIe maxima suportada por cada GPU (ex.: L40S = Gen4, Blackwell = Gen5)
+    declare -A GPU_GEN_MAX
+    while IFS=', ' read -r gi gg; do
+        [[ "$gg" =~ ^[0-9]+$ ]] && GPU_GEN_MAX[$gi]=$gg
+    done < <(timeout 30 nvidia-smi --query-gpu=index,pcie.link.gen.gpumax --format=csv,noheader,nounits 2>/dev/null)
     TEL_GPUS=0
     while read -r g tmax tmem ns nterm nhws nbrk nswp genmax nload eccmax; do
         [ -z "$g" ] && continue
@@ -313,8 +318,8 @@ if [ "$TELEMETRY_ON" = true ]; then
         fi
         if [ "$nload" -eq 0 ] || [ "$genmax" = "NA" ]; then
             AVISOS+=("Telemetria: GPU $g sem amostras sob carga (>= ${LOAD_UTIL_PCT}% de uso); geracao PCIe sob carga nao verificada.")
-        elif [ "$genmax" -lt "$EXPECTED_PCIE_GEN" ]; then
-            ST_STATUS[6]="REPROVADO"; MOTIVOS+=("Telemetria: GPU $g nao passou de PCIe Gen$genmax sob carga (esperado Gen$EXPECTED_PCIE_GEN).")
+        elif [ "$genmax" -lt "${GPU_GEN_MAX[$g]:-$EXPECTED_PCIE_GEN}" ]; then
+            ST_STATUS[6]="REPROVADO"; MOTIVOS+=("Telemetria: GPU $g nao passou de PCIe Gen$genmax sob carga (esperado Gen${GPU_GEN_MAX[$g]:-$EXPECTED_PCIE_GEN}).")
         fi
         if [ "$eccmax" != "NA" ] && [ "$eccmax" -gt 0 ]; then
             ST_STATUS[6]="REPROVADO"; MOTIVOS+=("Telemetria: GPU $g com $eccmax erro(s) ECC nao corrigido(s).")
@@ -353,7 +358,9 @@ SYS_VENDOR=$(dmidecode -s system-manufacturer 2>/dev/null | head -n1)
 SYS_MODEL=$(dmidecode -s system-product-name 2>/dev/null | head -n1)
 SYS_SERIAL=$(dmidecode -s system-serial-number 2>/dev/null | head -n1)
 BIOS_VER=$(dmidecode -s bios-version 2>/dev/null | head -n1)
-DRIVER_VER=$(grep -m1 "Driver Version" "$BASE_DIR/inventario/nvidia-smi-q.txt" 2>/dev/null | awk -F: '{gsub(/ /, "", $2); print $2}')
+DRIVER_VER=$(grep -m1 -E "^ *(KMD Version|Driver Version)" "$BASE_DIR/inventario/nvidia-smi-q.txt" 2>/dev/null | awk -F: '{print $2}' | awk '{print $1}')
+DRIVER_CUDA=$(grep -m1 -E "^ *(CUDA UMD Version|CUDA Version)" "$BASE_DIR/inventario/nvidia-smi-q.txt" 2>/dev/null | awk -F: '{print $2}' | awk '{print $1}')
+GPU_MODELS=$(grep -oE "^GPU [0-9]+: [^(]+" "$BASE_DIR/inventario/gpus.txt" 2>/dev/null | sed -E 's/^GPU [0-9]+: //; s/ +$//' | sort | uniq -c | awk '{c = $1; $1 = ""; sub(/^ /, ""); printf "%s%sx %s", (NR > 1 ? ", " : ""), c, $0}')
 CUDA_VER=$(grep -oE "release [0-9.]+" "$BASE_DIR/inventario/cuda-version.txt" 2>/dev/null | awk '{print $2}')
 NCCL_VER=$(awk '/^libnccl2 /{print $2}' "$BASE_DIR/inventario/nccl-version.txt" 2>/dev/null)
 DCGM_VER=$(grep -m1 -i "version" "$BASE_DIR/inventario/dcgm-version.txt" 2>/dev/null | sed 's/^ *//')
@@ -366,6 +373,7 @@ NCCLT_COMMIT=$(grep -m1 "nccl-tests: commit" "${NCCL_SUM:-/dev/null}" 2>/dev/nul
     echo "=================================================================="
     echo "Host:      $HOST"
     echo "Servidor:  ${SYS_VENDOR:-?} ${SYS_MODEL:-?} | Serial: ${SYS_SERIAL:-?} | BIOS: ${BIOS_VER:-?}"
+    echo "GPUs:      ${GPU_MODELS:-?}"
     echo "Inicio:    $(date -d "@$START_EPOCH" '+%Y-%m-%d %H:%M:%S')"
     echo "Fim:       $(date -d "@$END_EPOCH" '+%Y-%m-%d %H:%M:%S') (duracao total: $(fmt_dur $((END_EPOCH - START_EPOCH))))"
     echo ""
@@ -416,7 +424,11 @@ NCCLT_COMMIT=$(grep -m1 "nccl-tests: commit" "${NCCL_SUM:-/dev/null}" 2>/dev/nul
     if [ -n "${TEL_TABLE:-}" ]; then
         printf "  %-4s %-9s %-9s %-9s %-11s %-11s %-12s %-9s\n" "GPU" "Temp max" "Mem max" "Amostras" "Thr.termico" "HW slow/brk" "PCIe (carga)" "ECC n/c"
         while read -r g tmax tmem ns nterm nhws nbrk nswp genmax nload eccmax; do
-            printf "  %-4s %-9s %-9s %-9s %-11s %-11s %-12s %-9s\n" "$g" "${tmax}C" "${tmem}C" "$ns" "$nterm" "$((nhws + nbrk))" "Gen$genmax" "$eccmax"
+            [ "$tmax" = "NA" ] && tmax="N/A" || tmax="${tmax}C"
+            [ "$tmem" = "NA" ] && tmem="N/A" || tmem="${tmem}C"
+            [ "$genmax" = "NA" ] && genmax="N/A" || genmax="Gen$genmax"
+            [ "$eccmax" = "NA" ] && eccmax="N/A"
+            printf "  %-4s %-9s %-9s %-9s %-11s %-11s %-12s %-9s\n" "$g" "$tmax" "$tmem" "$ns" "$nterm" "$((nhws + nbrk))" "$genmax" "$eccmax"
         done <<< "$TEL_TABLE"
         echo "  Eventos Xid no log do kernel (desde o boot): ${XID_SUMMARY:-nenhum}"
     else
@@ -426,7 +438,7 @@ NCCLT_COMMIT=$(grep -m1 "nccl-tests: commit" "${NCCL_SUM:-/dev/null}" 2>/dev/nul
     echo "------------------------------------------------------------------"
     echo "VERSOES"
     echo "------------------------------------------------------------------"
-    echo "  Driver NVIDIA: ${DRIVER_VER:-?} | CUDA: ${CUDA_VER:-?} | NCCL: ${NCCL_VER:-?}"
+    echo "  Driver NVIDIA: ${DRIVER_VER:-?} (CUDA suportado pelo driver: ${DRIVER_CUDA:-?}) | CUDA Toolkit: ${CUDA_VER:-?} | NCCL: ${NCCL_VER:-?}"
     echo "  DCGM: ${DCGM_VER:-?}"
     echo "  vLLM: ${VLLM_IMG:-?}"
     echo "  nccl-tests: ${NCCLT_COMMIT:-?}"

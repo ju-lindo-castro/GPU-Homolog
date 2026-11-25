@@ -1,5 +1,5 @@
 #!/bin/bash
-# Modulo 1: Inventario e Preparacao do Ambiente (v12 - Driver NVIDIA automatico, DCGM 4, CUDA/NCCL alinhados ao driver, Docker/NVIDIA Container Toolkit, Auditoria PCIe e de GPUs)
+# Modulo 1: Inventario e Preparacao do Ambiente (v13 - Driver NVIDIA automatico, DCGM 4, CUDA/NCCL alinhados ao driver, Docker/NVIDIA Container Toolkit, Auditoria PCIe e de GPUs)
 # Codigos de saida: 0 = concluido | 1 = falha critica | 4 = driver NVIDIA instalado, reboot necessario
 
 BASE_DIR="$HOME/homologacao"
@@ -15,7 +15,7 @@ log() {
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-log "--- Iniciando Script de Inventario (v12) ---"
+log "--- Iniciando Script de Inventario (v13) ---"
 
 # 0. Correcao para imagens limpas (Minimal/Server) do Ubuntu
 log "Etapa: Preparacao base do sistema (apt-utils e correcao Java/Manpages) - Iniciado"
@@ -153,7 +153,18 @@ if dpkg -s nvidia-cuda-toolkit &>/dev/null; then
     fi
 fi
 
-DRIVER_CUDA=$(nvidia-smi 2>/dev/null | grep -oE "CUDA Version: [0-9]+\.[0-9]+" | awk '{print $3}' | head -n1)
+# Versao maxima de CUDA suportada pelo driver (compativel com o formato antigo e o novo do driver 620+)
+get_driver_cuda() {
+    local v
+    v=$(nvidia-smi -q 2>/dev/null | grep -oE "CUDA UMD Version *: *[0-9]+\.[0-9]+" | grep -oE "[0-9]+\.[0-9]+$" | head -n1)
+    [ -z "$v" ] && v=$(nvidia-smi -q 2>/dev/null | grep -oE "CUDA Version *: *[0-9]+\.[0-9]+" | grep -oE "[0-9]+\.[0-9]+$" | head -n1)
+    [ -z "$v" ] && v=$(nvidia-smi 2>/dev/null | grep -oE "CUDA (UMD )?Version: *[0-9]+\.[0-9]+" | grep -oE "[0-9]+\.[0-9]+$" | head -n1)
+    if [ -z "$v" ] && command -v python3 &> /dev/null; then
+        v=$(python3 -c 'import ctypes; l = ctypes.CDLL("libcuda.so.1"); x = ctypes.c_int(); l.cuDriverGetVersion(ctypes.byref(x)); print("%d.%d" % (x.value // 1000, (x.value % 1000) // 10))' 2>/dev/null)
+    fi
+    echo "$v"
+}
+DRIVER_CUDA=$(get_driver_cuda)
 CUDA_VER=""
 log "Etapa: Instalacao do CUDA Toolkit - Iniciado (driver suporta ate CUDA ${DRIVER_CUDA:-desconhecido})"
 if [ -z "$DRIVER_CUDA" ]; then
@@ -321,7 +332,8 @@ fi
 if command -v docker &> /dev/null && command -v nvidia-ctk &> /dev/null; then
     # Configura o runtime NVIDIA no Docker apenas se ainda nao estiver registrado (evita reiniciar o Docker a toa)
     log "Etapa: Configuracao do runtime NVIDIA no Docker - Iniciado"
-    if sudo docker info 2>/dev/null | grep -qi "nvidia"; then
+    # Verifica o runtime registrado (a saida completa do docker info cita "nvidia" mesmo sem o runtime configurado)
+    if sudo docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'; then
         log "Etapa: Configuracao do runtime NVIDIA no Docker - Finalizado (Ja configurado)"
     elif sudo nvidia-ctk runtime configure --runtime=docker &>/tmp/err_ctk_config.log && sudo systemctl restart docker &>>/tmp/err_ctk_config.log; then
         log "Etapa: Configuracao do runtime NVIDIA no Docker - Finalizado (Configurado e Docker reiniciado)"
@@ -334,6 +346,15 @@ if command -v docker &> /dev/null && command -v nvidia-ctk &> /dev/null; then
     log "Etapa: Validacao de GPUs dentro do container Docker - Iniciado"
     CONTAINER_OUT=$(sudo docker run --rm --gpus all ubuntu nvidia-smi -L 2>&1 || true)
     CONTAINER_GPUS=$(echo "$CONTAINER_OUT" | grep -cE "^GPU [0-9]+:" || true)
+    if [ "$CONTAINER_GPUS" -lt "$EXPECTED_GPUS" ]; then
+        # Autocorrecao: reconfigura o runtime NVIDIA, reinicia o Docker e tenta mais uma vez
+        log "Etapa: Validacao de GPUs dentro do container Docker - Aviso: $CONTAINER_GPUS/$EXPECTED_GPUS GPUs; reconfigurando o runtime NVIDIA e tentando novamente..."
+        sudo nvidia-ctk runtime configure --runtime=docker &>>/tmp/err_ctk_config.log
+        sudo systemctl restart docker &>>/tmp/err_ctk_config.log
+        sleep 5
+        CONTAINER_OUT=$(sudo docker run --rm --gpus all ubuntu nvidia-smi -L 2>&1 || true)
+        CONTAINER_GPUS=$(echo "$CONTAINER_OUT" | grep -cE "^GPU [0-9]+:" || true)
+    fi
     if [ "$CONTAINER_GPUS" -ge "$EXPECTED_GPUS" ]; then
         log "Etapa: Validacao de GPUs dentro do container Docker - Finalizado ($CONTAINER_GPUS/$EXPECTED_GPUS GPUs visiveis)"
     else
@@ -391,26 +412,34 @@ if command -v ipmitool &> /dev/null; then
 fi
 
 # ==============================================================================
-# Validacao do link PCIe de cada GPU (largura atual e geracao maxima suportada)
+# Validacao do link PCIe de cada GPU (largura atual e geracao maxima do link)
 # A geracao ATUAL cai com a GPU ociosa (economia de energia), por isso valida-se
-# a geracao MAXIMA suportada; a geracao sob carga e verificada na telemetria.
+# a geracao MAXIMA do link; a geracao sob carga e verificada na telemetria.
+# A geracao esperada e o maximo suportado pela propria GPU (ex.: L40S = Gen4,
+# RTX PRO 6000 Blackwell = Gen5): reprova quando a plataforma limita a GPU.
+# EXPECTED_PCIE_GEN so e usado se o driver nao informar o maximo da GPU.
 # ==============================================================================
 EXPECTED_PCIE_GEN=5
 EXPECTED_PCIE_WIDTH=16
 PCIE_FAIL=0
 
-log "--- Validacao do Link PCIe (esperado: Gen$EXPECTED_PCIE_GEN x$EXPECTED_PCIE_WIDTH) ---"
-while IFS=', ' read -r idx bus gen_max width_cur; do
+PCIE_FIELDS="index,pci.bus_id,pcie.link.gen.max,pcie.link.width.current,pcie.link.gen.gpumax"
+nvidia-smi --query-gpu=pcie.link.gen.gpumax --format=csv,noheader &> /dev/null || PCIE_FIELDS="index,pci.bus_id,pcie.link.gen.max,pcie.link.width.current"
+
+log "--- Validacao do Link PCIe (esperado: geracao maxima suportada pela GPU, x$EXPECTED_PCIE_WIDTH) ---"
+while IFS=', ' read -r idx bus gen_max width_cur gpu_gen_max; do
+    exp_gen="$EXPECTED_PCIE_GEN"
+    [[ "$gpu_gen_max" =~ ^[0-9]+$ ]] && exp_gen="$gpu_gen_max"
     if ! [[ "$gen_max" =~ ^[0-9]+$ && "$width_cur" =~ ^[0-9]+$ ]]; then
         log "GPU $idx ($bus): ERRO - nao foi possivel ler o link PCIe (gen_max=$gen_max, width=$width_cur)"
         PCIE_FAIL=$((PCIE_FAIL + 1))
-    elif [ "$width_cur" -lt "$EXPECTED_PCIE_WIDTH" ] || [ "$gen_max" -lt "$EXPECTED_PCIE_GEN" ]; then
-        log "GPU $idx ($bus): FALHA - link Gen$gen_max x$width_cur (esperado Gen$EXPECTED_PCIE_GEN x$EXPECTED_PCIE_WIDTH)"
+    elif [ "$width_cur" -lt "$EXPECTED_PCIE_WIDTH" ] || [ "$gen_max" -lt "$exp_gen" ]; then
+        log "GPU $idx ($bus): FALHA - link Gen$gen_max x$width_cur (esperado Gen$exp_gen x$EXPECTED_PCIE_WIDTH)"
         PCIE_FAIL=$((PCIE_FAIL + 1))
     else
-        log "GPU $idx ($bus): OK - Gen$gen_max x$width_cur"
+        log "GPU $idx ($bus): OK - Gen$gen_max x$width_cur (maximo da GPU: Gen$exp_gen)"
     fi
-done < <(nvidia-smi --query-gpu=index,pci.bus_id,pcie.link.gen.max,pcie.link.width.current --format=csv,noheader,nounits 2>/dev/null)
+done < <(nvidia-smi --query-gpu="$PCIE_FIELDS" --format=csv,noheader,nounits 2>/dev/null)
 
 # ==============================================================================
 # Auditoria de Integridade Pos-Coleta (Alerta imediato de GPU caida/Reboot)
