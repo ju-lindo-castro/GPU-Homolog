@@ -1,5 +1,5 @@
 #!/bin/bash
-# Modulo 3: Teste de Comunicacao NCCL (AllReduce) - Versao Universal (v12 - criterio de aprovacao + CUDA/NCCL do Modulo 1 + rodadas com e sem P2P)
+# Modulo 3: Teste de Comunicacao NCCL (AllReduce) - Versao Universal (v13 - criterio de aprovacao + CUDA/NCCL do Modulo 1 + rodadas com e sem P2P + arquitetura detectada)
 
 set -eo pipefail
 
@@ -22,7 +22,7 @@ log() {
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-log "--- Iniciando Script de Teste NCCL (Modo Universal v12) ---"
+log "--- Iniciando Script de Teste NCCL (Modo Universal v13) ---"
 
 # CUDA Toolkit e NCCL sao instalados pelo Modulo 1 (versoes alinhadas ao driver)
 CUDA_HOME=/usr/local/cuda
@@ -69,8 +69,20 @@ log "nccl-tests: commit $NCCL_TESTS_COMMIT (referencia: ${NCCL_TESTS_REF:-ramo p
 # Forca compilacao SEM MPI. 
 # Como o teste e local (8 GPUs na mesma placa mae), o MPI causa mais problemas do que ajuda na compilacao.
 log "Compilando nccl-tests (Modo Single-Node, sem MPI)..."
-# Compila explicitamente para Blackwell (sm_120) usando o CUDA e a NCCL instalados pelo Modulo 1
-if make clean &>> "$LOG_FILE" && make CUDA_HOME="$CUDA_HOME" NCCL_HOME=/usr NVCC_GENCODE="-gencode=arch=compute_120,code=sm_120" &>> "$LOG_FILE"; then
+# Compila para a arquitetura das GPUs instaladas (ex.: L40S = 8.9 -> sm_89; RTX PRO 6000 Blackwell = 12.0 -> sm_120),
+# usando o CUDA e a NCCL instalados pelo Modulo 1
+NVCC_GENCODE=""
+for cc in $(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | tr -d ' .' | sort -u); do
+    [[ "$cc" =~ ^[0-9]+$ ]] && NVCC_GENCODE="${NVCC_GENCODE:+$NVCC_GENCODE }-gencode=arch=compute_${cc},code=sm_${cc}"
+done
+MAKE_ARGS=(CUDA_HOME="$CUDA_HOME" NCCL_HOME=/usr)
+if [ -n "$NVCC_GENCODE" ]; then
+    MAKE_ARGS+=(NVCC_GENCODE="$NVCC_GENCODE")
+    log "Arquitetura(s) das GPUs para compilacao: $NVCC_GENCODE"
+else
+    log "AVISO: nao foi possivel detectar a arquitetura das GPUs; usando as arquiteturas padrao do nccl-tests."
+fi
+if make clean &>> "$LOG_FILE" && make "${MAKE_ARGS[@]}" &>> "$LOG_FILE"; then
     log "Compilacao concluida com sucesso."
 else
     log "ERRO: Falha na compilacao. Verifique o log: $LOG_FILE"

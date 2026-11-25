@@ -159,6 +159,7 @@ Ficam **apenas registrados**, sem reprovar: o throughput do vLLM, a banda do NCC
 - Instala o **Docker** e o **NVIDIA Container Toolkit** (versão fixa `1.20.2-1`) e confirma que um container enxerga as 8 GPUs.
 - Coleta o inventário: `nvidia-smi -q`, topologia, PCIe, CPU, memória, discos, `lspci`, IPMI SEL e versões de software.
 - Audita a quantidade de GPUs (`EXPECTED_GPUS=8`), o link PCIe de cada GPU (geração máxima suportada pela própria GPU, largura x16) e o estado de *Recovery Action*.
+- Registra o modo do IOMMU e a linha de comando do kernel. Avisa quando o IOMMU está em modo de tradução, porque isso pode fazer o P2P entre GPUs falhar ou corromper dados (veja [Solução de problemas](#solução-de-problemas)).
 
 ### Módulo 2 — Diagnóstico DCGM
 
@@ -175,7 +176,7 @@ Ficam **apenas registrados**, sem reprovar: o throughput do vLLM, a banda do NCC
 
 ### Módulo 3 — NCCL AllReduce
 
-- Compila o `nccl-tests` para Blackwell (`sm_120`) usando o CUDA e a NCCL do Módulo 1.
+- Compila o `nccl-tests` para a arquitetura detectada das GPUs (por exemplo, L40S = `sm_89` e RTX PRO 6000 Blackwell = `sm_120`), usando o CUDA e a NCCL do Módulo 1.
 - **Rodada 1, com P2P (diagnóstico):** timeout de 10 minutos. Se travar ou falhar, é registrada como "P2P indisponível". Em plataformas com ACS/IOMMU (como o XE7745) o P2P nativo pode ser restrito.
 - **Rodada 2, sem P2P (`NCCL_P2P_DISABLE=1`):** é o critério oficial de aprovação.
 - Gera `benchmark/nccl_resumo.txt` com a banda das duas rodadas, a integridade dos dados e o commit do `nccl-tests` usado.
@@ -197,6 +198,29 @@ Ficam **apenas registrados**, sem reprovar: o throughput do vLLM, a banda do NCC
 - Executa `vllm bench throughput` com o Llama 3.3 70B Instruct, TP=8 e 1.000 prompts do dataset ShareGPT.
 - Usa a imagem fixa `vllm/vllm-openai:v0.34.0`, para que os resultados sejam comparáveis entre homologações. A imagem e o digest ficam registrados no resumo.
 - O token é lido da variável `HF_TOKEN`; o orquestrador a preenche a partir do `-t`.
+
+---
+
+## Solução de problemas
+
+### Falhas de P2P no DCGM (`P2P write verification failed: buffer mismatch`)
+
+Quando muitos pares de GPUs falham no teste `pcie` do DCGM, a causa costuma ser a **plataforma**, não uma GPU com defeito. Em servidores bare-metal, o IOMMU em modo de tradução (comum em AMD EPYC) ou o ACS podem corromper as cópias diretas entre GPUs. O Módulo 1 mostra o modo do IOMMU no relatório e avisa quando ele está em modo de tradução.
+
+1. Confirme o modo do IOMMU:
+   ```bash
+   cat /proc/cmdline
+   sudo dmesg | grep -iE "iommu|AMD-Vi" | head
+   nvidia-smi topo -p2p p
+   ```
+2. Coloque o IOMMU em passthrough (menos invasivo; reversível pelo GRUB): adicione `iommu=pt` ao `GRUB_CMDLINE_LINUX` em `/etc/default/grub`, rode `sudo update-grub` e reinicie.
+3. Se não resolver e o servidor **não** usar virtualização com passthrough de GPU (VFIO/SR-IOV), desligue o IOMMU na BIOS e revise as opções de ACS.
+4. Valide em poucos minutos, antes de rodar a homologação completa:
+   ```bash
+   sudo dcgmi diag -r pcie
+   ```
+
+Essas são mudanças de configuração no servidor do cliente: combine com ele antes de aplicar.
 
 ---
 

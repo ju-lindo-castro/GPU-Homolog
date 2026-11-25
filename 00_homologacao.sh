@@ -1,5 +1,5 @@
 #!/bin/bash
-# Modulo 0: Orquestrador da Homologacao (v4 - execucao direto do GitHub + instalacao do driver com reboot + PCIe pelo maximo da GPU)
+# Modulo 0: Orquestrador da Homologacao (v5 - execucao direto do GitHub + instalacao do driver com reboot + PCIe pelo maximo da GPU + diagnostico de P2P/IOMMU)
 # Executa todos os modulos no fluxo recomendado (mesmo que algum falhe), coleta as metricas e
 # gera o relatorio APROVADO/REPROVADO com um pacote de todos os arquivos da execucao.
 # Se os modulos 01-05 nao estiverem no mesmo diretorio, baixa-os do repositorio GitHub.
@@ -151,7 +151,7 @@ elif [ -n "$INV_ALERTS" ]; then
 else
     ST_STATUS[1]="APROVADO"
 fi
-while IFS= read -r e; do [ -n "$e" ] && AVISOS+=("Inventario: $e"); done < <(grep -E " - Erro:| - Aviso:" "$INV_LOG" 2>/dev/null | sed -E 's/^\[[^]]*\] //')
+while IFS= read -r e; do [ -n "$e" ] && AVISOS+=("Inventario: $e"); done < <(grep -E " - Erro:| - Aviso:|AVISO DE PLATAFORMA" "$INV_LOG" 2>/dev/null | sed -E 's/^\[[^]]*\] //')
 
 # Relatorio curto para execucoes interrompidas antes dos testes (driver pendente ou ausente)
 short_report() {
@@ -222,7 +222,13 @@ DCGM_LOG=$(newest "$BASE_DIR/dcgm" "diag_execucao_*.log")
 case "$RC" in
     0) ST_STATUS[3]="APROVADO" ;;
     2) ST_STATUS[3]="REPROVADO"; MOTIVOS+=("DCGM: GPU caiu do barramento ou exige reboot (codigo 2).") ;;
-    3) ST_STATUS[3]="REPROVADO"; MOTIVOS+=("DCGM: hardware reprovado no diagnostico (codigo 3). Detalhes na secao DCGM.") ;;
+    3) ST_STATUS[3]="REPROVADO"; MOTIVOS+=("DCGM: hardware reprovado no diagnostico (codigo 3). Detalhes na secao DCGM.")
+       # Falhas de P2P costumam vir da plataforma (IOMMU/ACS), nao de uma GPU com defeito
+       P2P_FAILS=$(grep -cE "\[FAIL\] Teste: pcie .*peer-to-peer" "$DCGM_LOG" 2>/dev/null)
+       if [ "${P2P_FAILS:-0}" -gt 0 ]; then
+           IOMMU_INFO=$(grep -m1 -oE "IOMMU: [^|]+" "$INV_LOG" 2>/dev/null | sed 's/ *$//')
+           MOTIVOS+=("DCGM: $P2P_FAILS falha(s) de P2P (dados corrompidos entre GPUs). Causa mais comum: IOMMU em modo de traducao ou ACS, nao uma GPU com defeito (${IOMMU_INFO:-IOMMU: nao verificado}). Recomendacao: iommu=pt no kernel ou IOMMU desligado na BIOS; depois validar com 'sudo dcgmi diag -r pcie'.")
+       fi ;;
     *) ST_STATUS[3]="FALHOU";    MOTIVOS+=("DCGM: erro de software/utilitario (codigo $RC); diagnostico incompleto.") ;;
 esac
 
@@ -397,7 +403,7 @@ NCCLT_COMMIT=$(grep -m1 "nccl-tests: commit" "${NCCL_SUM:-/dev/null}" 2>/dev/nul
     echo "------------------------------------------------------------------"
     echo "HARDWARE (Modulo 1)"
     echo "------------------------------------------------------------------"
-    grep -E "GPUs esperadas:|GPU [0-9]+ \(.*\): (OK|FALHA|ERRO)|Validacao de GPUs dentro do container|STATUS DO HARDWARE|ALERTA CRITICO" "$INV_LOG" 2>/dev/null | sed -E 's/^\[[^]]*\] /  /'
+    grep -E "GPUs esperadas:|GPU [0-9]+ \(.*\): (OK|FALHA|ERRO)|Validacao de GPUs dentro do container|IOMMU: |AVISO DE PLATAFORMA|STATUS DO HARDWARE|ALERTA CRITICO" "$INV_LOG" 2>/dev/null | sed -E 's/^\[[^]]*\] /  /'
     echo ""
     echo "------------------------------------------------------------------"
     echo "DIAGNOSTICO DCGM (Modulo 2, nivel $DCGM_LEVEL)"

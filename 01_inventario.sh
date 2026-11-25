@@ -1,5 +1,5 @@
 #!/bin/bash
-# Modulo 1: Inventario e Preparacao do Ambiente (v13 - Driver NVIDIA automatico, DCGM 4, CUDA/NCCL alinhados ao driver, Docker/NVIDIA Container Toolkit, Auditoria PCIe e de GPUs)
+# Modulo 1: Inventario e Preparacao do Ambiente (v14 - Driver NVIDIA automatico, DCGM 4, CUDA/NCCL alinhados ao driver, Docker/NVIDIA Container Toolkit, Auditoria PCIe e de GPUs)
 # Codigos de saida: 0 = concluido | 1 = falha critica | 4 = driver NVIDIA instalado, reboot necessario
 
 BASE_DIR="$HOME/homologacao"
@@ -15,7 +15,7 @@ log() {
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-log "--- Iniciando Script de Inventario (v13) ---"
+log "--- Iniciando Script de Inventario (v14) ---"
 
 # 0. Correcao para imagens limpas (Minimal/Server) do Ubuntu
 log "Etapa: Preparacao base do sistema (apt-utils e correcao Java/Manpages) - Iniciado"
@@ -402,6 +402,7 @@ if command -v docker &> /dev/null; then
 fi
 
 collect_data "Coleta Kernel Info" "uname -a" "$BASE_DIR/inventario/kernel.txt"
+collect_data "Coleta Kernel Cmdline" "cat /proc/cmdline" "$BASE_DIR/inventario/cmdline.txt"
 collect_data "Coleta CPU Info" "lscpu" "$BASE_DIR/inventario/lscpu.txt"
 collect_data "Coleta Memoria RAM" "free -h" "$BASE_DIR/inventario/free.txt"
 collect_data "Coleta Discos" "lsblk" "$BASE_DIR/inventario/lsblk.txt"
@@ -440,6 +441,27 @@ while IFS=', ' read -r idx bus gen_max width_cur gpu_gen_max; do
         log "GPU $idx ($bus): OK - Gen$gen_max x$width_cur (maximo da GPU: Gen$exp_gen)"
     fi
 done < <(nvidia-smi --query-gpu="$PCIE_FIELDS" --format=csv,noheader,nounits 2>/dev/null)
+
+# ==============================================================================
+# Verificacao do IOMMU: em servidores bare-metal, o IOMMU em modo de traducao pode
+# fazer o P2P entre GPUs falhar ou corromper dados (teste pcie do DCGM)
+# ==============================================================================
+log "--- Verificacao do IOMMU (P2P entre GPUs) ---"
+IOMMU_MODE="desligado"
+if [ -n "$(ls -A /sys/kernel/iommu_groups 2>/dev/null)" ]; then
+    GPU_BDF=$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader 2>/dev/null | head -n1 | tr 'A-F' 'a-f')
+    GPU_BDF="${GPU_BDF: -12}"
+    IOMMU_TYPE=$(cat "/sys/bus/pci/devices/$GPU_BDF/iommu_group/type" 2>/dev/null)
+    case "$IOMMU_TYPE" in
+        identity) IOMMU_MODE="passthrough" ;;
+        DMA*)     IOMMU_MODE="traducao ($IOMMU_TYPE)" ;;
+        *)        IOMMU_MODE="ligado (tipo: ${IOMMU_TYPE:-desconhecido})" ;;
+    esac
+fi
+log "IOMMU: $IOMMU_MODE | Kernel cmdline: $(cat /proc/cmdline 2>/dev/null)"
+if [[ "$IOMMU_MODE" == traducao* ]]; then
+    log "AVISO DE PLATAFORMA: IOMMU em modo de traducao. Em servidores bare-metal, o P2P entre GPUs pode falhar ou corromper dados. Recomendacao: adicionar iommu=pt ao GRUB_CMDLINE_LINUX e reiniciar, ou desligar o IOMMU na BIOS se o servidor nao usa virtualizacao com passthrough."
+fi
 
 # ==============================================================================
 # Auditoria de Integridade Pos-Coleta (Alerta imediato de GPU caida/Reboot)
