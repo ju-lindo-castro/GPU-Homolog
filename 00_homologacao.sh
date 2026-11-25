@@ -1,5 +1,5 @@
 #!/bin/bash
-# Modulo 0: Orquestrador da Homologacao (v5 - execucao direto do GitHub + instalacao do driver com reboot + PCIe pelo maximo da GPU + diagnostico de P2P/IOMMU)
+# Modulo 0: Orquestrador da Homologacao (v6 - execucao direto do GitHub + instalacao do driver com reboot + PCIe pelo maximo da GPU + diagnostico de P2P/IOMMU + GPU em falha e consequencias)
 # Executa todos os modulos no fluxo recomendado (mesmo que algum falhe), coleta as metricas e
 # gera o relatorio APROVADO/REPROVADO com um pacote de todos os arquivos da execucao.
 # Se os modulos 01-05 nao estiverem no mesmo diretorio, baixa-os do repositorio GitHub.
@@ -73,6 +73,14 @@ touch "$STAMP"
 log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$ORCH_LOG"; }
 fmt_dur() { printf '%02d:%02d:%02d' $(($1 / 3600)) $(($1 % 3600 / 60)) $(($1 % 60)); }
 # Arquivo mais recente de um padrao, gerado nesta execucao
+# Identifica uma GPU pelo endereco PCI (ex.: 0000:21:00) usando o inventario coletado no inicio
+gpu_id_from_pci() {
+    local key idx serial
+    key=$(echo "$1" | tr 'A-F' 'a-f' | sed -E 's/^[0-9a-f]+:([0-9a-f]{2}:[0-9a-f]{2}).*/\1/')
+    idx=$(awk -F', *' -v k=":$key" 'NR > 1 && index(tolower($3), k) {print $1; exit}' "$BASE_DIR/inventario/pcie_status.txt" 2>/dev/null)
+    serial=$(awk -v k=":$key" 'tolower($0) ~ /^gpu [0-9a-f]+:/ {f = index(tolower($0), k) > 0} f && /^    Serial Number/ {sub(/.*: */, ""); print; exit}' "$BASE_DIR/inventario/nvidia-smi-q.txt" 2>/dev/null)
+    echo "GPU ${idx:-?} (PCI $1, serial ${serial:-?})"
+}
 newest() { find "$1" -maxdepth 1 -name "$2" -newer "$STAMP" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n1 | cut -d' ' -f2-; }
 
 # ==============================================================================
@@ -108,6 +116,8 @@ declare -A ST_STATUS ST_DUR ST_DESC
 STAGES=()
 MOTIVOS=()
 AVISOS=()
+CONSEQ=()          # falhas causadas por uma GPU que ja estava em falha (nao sao problemas independentes)
+GPU_FAILED=false
 START_EPOCH=$(date +%s)
 TELEMETRY_ON=false
 
@@ -221,7 +231,9 @@ RC=$?
 DCGM_LOG=$(newest "$BASE_DIR/dcgm" "diag_execucao_*.log")
 case "$RC" in
     0) ST_STATUS[3]="APROVADO" ;;
-    2) ST_STATUS[3]="REPROVADO"; MOTIVOS+=("DCGM: GPU caiu do barramento ou exige reboot (codigo 2).") ;;
+    2) ST_STATUS[3]="REPROVADO"; GPU_FAILED=true
+       DCGM_DIAG=$(grep -m1 -oE "DIAGNOSTICO FINAL: .*" "$DCGM_LOG" 2>/dev/null | sed 's/^DIAGNOSTICO FINAL: //')
+       MOTIVOS+=("DCGM: ${DCGM_DIAG:-GPU caiu do barramento ou ficou pendente de reset} (codigo 2; reboot obrigatorio).") ;;
     3) ST_STATUS[3]="REPROVADO"; MOTIVOS+=("DCGM: hardware reprovado no diagnostico (codigo 3). Detalhes na secao DCGM.")
        # Falhas de P2P costumam vir da plataforma (IOMMU/ACS), nao de uma GPU com defeito
        P2P_FAILS=$(grep -cE "\[FAIL\] Teste: pcie .*peer-to-peer" "$DCGM_LOG" 2>/dev/null)
@@ -243,7 +255,11 @@ case "$RC" in
     0) ST_STATUS[4]="APROVADO" ;;
     3) ST_STATUS[4]="REPROVADO"
        while IFS= read -r a; do MOTIVOS+=("NCCL: ${a#  - }"); done < <(grep "^  - " "${NCCL_SUM:-/dev/null}") ;;
-    *) ST_STATUS[4]="FALHOU"; MOTIVOS+=("NCCL: erro de execucao (codigo $RC); teste incompleto.") ;;
+    *) if [ "$GPU_FAILED" = true ]; then
+           ST_STATUS[4]="AFETADO"; CONSEQ+=("NCCL: falhou (codigo $RC) porque uma GPU ja estava em falha desde o DCGM.")
+       else
+           ST_STATUS[4]="FALHOU"; MOTIVOS+=("NCCL: erro de execucao (codigo $RC); teste incompleto.")
+       fi ;;
 esac
 
 # ==============================================================================
@@ -255,7 +271,11 @@ VLLM_SUM=$(newest "$BASE_DIR/benchmark" "vllm_resumo_*.txt")
 if [ "$RC" -eq 0 ]; then
     ST_STATUS[5]="APROVADO"
 else
-    ST_STATUS[5]="FALHOU"; MOTIVOS+=("vLLM: o benchmark falhou (codigo $RC). Ver log completo em $BASE_DIR/logs.")
+    if [ "$GPU_FAILED" = true ]; then
+        ST_STATUS[5]="AFETADO"; CONSEQ+=("vLLM: falhou (codigo $RC) porque uma GPU ja estava em falha desde o DCGM.")
+    else
+        ST_STATUS[5]="FALHOU"; MOTIVOS+=("vLLM: o benchmark falhou (codigo $RC). Ver log completo em $BASE_DIR/logs.")
+    fi
 fi
 VLLM_TPUT=$(grep -i "Throughput" "${VLLM_SUM:-/dev/null}" 2>/dev/null | tail -n1 | sed 's/^ *//')
 
@@ -304,11 +324,17 @@ if [ "$TELEMETRY_ON" = true ]; then
     if [ -z "$TEL_TABLE" ]; then
         ST_STATUS[6]="FALHOU"; MOTIVOS+=("Telemetria: nenhuma amostra coletada; burn-in nao verificado.")
     fi
-    # Geracao PCIe maxima suportada por cada GPU (ex.: L40S = Gen4, Blackwell = Gen5)
+    # Geracao PCIe maxima suportada por cada GPU (ex.: L40S = Gen4, Blackwell = Gen5).
+    # Vem do inventario, coletado com as GPUs saudaveis; a consulta ao vivo so e usada se faltar.
     declare -A GPU_GEN_MAX
-    while IFS=', ' read -r gi gg; do
-        [[ "$gg" =~ ^[0-9]+$ ]] && GPU_GEN_MAX[$gi]=$gg
-    done < <(timeout 30 nvidia-smi --query-gpu=index,pcie.link.gen.gpumax --format=csv,noheader,nounits 2>/dev/null)
+    while read -r gi gg; do
+        GPU_GEN_MAX[$gi]=$gg
+    done < <(grep -oE "GPU [0-9]+ \(.*(maximo da GPU:|esperado) Gen[0-9]+" "$INV_LOG" 2>/dev/null | sed -E 's/^GPU ([0-9]+) .*Gen([0-9]+)$/\1 \2/')
+    if [ "${#GPU_GEN_MAX[@]}" -eq 0 ]; then
+        while IFS=', ' read -r gi gg; do
+            [[ "$gg" =~ ^[0-9]+$ ]] && GPU_GEN_MAX[$gi]=$gg
+        done < <(timeout 30 nvidia-smi --query-gpu=index,pcie.link.gen.gpumax --format=csv,noheader,nounits 2>/dev/null)
+    fi
     TEL_GPUS=0
     while read -r g tmax tmem ns nterm nhws nbrk nswp genmax nload eccmax; do
         [ -z "$g" ] && continue
@@ -337,19 +363,25 @@ if [ "$TELEMETRY_ON" = true ]; then
 
     # Log do kernel (o coletor le o buffer desde o boot: inclui eventos anteriores aos testes)
     XID_SUMMARY=$(grep -v '\[telemetria\]' "$TEL_KLOG" 2>/dev/null | grep -oE "Xid \([^)]*\): [0-9]+" | awk '{print $NF}' | sort -n | uniq -c | awk '{printf "Xid %s (%sx)  ", $2, $1}')
-    for x in $(grep -v '\[telemetria\]' "$TEL_KLOG" 2>/dev/null | grep -oE "Xid \([^)]*\): [0-9]+" | awk '{print $NF}' | sort -un); do
+    # Cada Xid e identificado pela GPU (indice, PCI e serial) em que ocorreu
+    while read -r x xpci; do
+        [ -z "$x" ] && continue
         if [[ " $CRITICAL_XIDS " == *" $x "* ]]; then
-            ST_STATUS[6]="REPROVADO"; MOTIVOS+=("Kernel: Xid critico $x registrado (ver log do kernel).")
+            ST_STATUS[6]="REPROVADO"; MOTIVOS+=("Kernel: Xid critico $x na $(gpu_id_from_pci "$xpci") (ver log do kernel).")
         else
-            AVISOS+=("Kernel: Xid $x registrado (nao critico; pode ter sido causado por aplicacao).")
+            AVISOS+=("Kernel: Xid $x na $(gpu_id_from_pci "$xpci") (nao critico; pode ter sido causado por aplicacao).")
         fi
-    done
+    done < <(grep -v '\[telemetria\]' "$TEL_KLOG" 2>/dev/null | grep -oE "Xid \(PCI:[0-9A-Fa-f:.]+\): [0-9]+" | sed -E 's/^Xid \(PCI:([^)]*)\): ([0-9]+)$/\2 \1/' | sort -u)
     if grep -v '\[telemetria\]' "$TEL_KLOG" 2>/dev/null | grep -qi "fallen off the bus"; then
         ST_STATUS[6]="REPROVADO"; MOTIVOS+=("Kernel: GPU caiu do barramento (\"fallen off the bus\").")
     fi
     NSMI_HANGS=$(grep -c "\[telemetria\] ALERTA: nvidia-smi" "$TEL_KLOG" 2>/dev/null)
     if [ "${NSMI_HANGS:-0}" -gt 0 ]; then
-        ST_STATUS[6]="REPROVADO"; MOTIVOS+=("Telemetria: nvidia-smi deixou de responder $NSMI_HANGS vez(es) (GPU travada ou caida).")
+        if [ "$GPU_FAILED" = true ]; then
+            CONSEQ+=("Telemetria: nvidia-smi deixou de responder $NSMI_HANGS vez(es), efeito da GPU em falha.")
+        else
+            ST_STATUS[6]="REPROVADO"; MOTIVOS+=("Telemetria: nvidia-smi deixou de responder $NSMI_HANGS vez(es) (GPU travada ou caida).")
+        fi
     fi
     log "ETAPA 6: ${ST_DESC[6]} - Finalizada (${ST_STATUS[6]})"
 fi
@@ -388,6 +420,10 @@ NCCLT_COMMIT=$(grep -m1 "nccl-tests: commit" "${NCCL_SUM:-/dev/null}" 2>/dev/nul
         echo "Motivos da reprovacao:"
         for m in "${MOTIVOS[@]}"; do echo "  - $m"; done
     fi
+    if [ "${#CONSEQ[@]}" -gt 0 ]; then
+        echo "Falhas em consequencia da GPU em falha (nao indicam problemas independentes):"
+        for c in "${CONSEQ[@]}"; do echo "  - $c"; done
+    fi
     if [ "${#AVISOS[@]}" -gt 0 ]; then
         echo "Avisos (nao reprovam):"
         for a in "${AVISOS[@]}"; do echo "  - $a"; done
@@ -409,7 +445,7 @@ NCCLT_COMMIT=$(grep -m1 "nccl-tests: commit" "${NCCL_SUM:-/dev/null}" 2>/dev/nul
     echo "DIAGNOSTICO DCGM (Modulo 2, nivel $DCGM_LEVEL)"
     echo "------------------------------------------------------------------"
     if [ -n "$DCGM_LOG" ]; then
-        grep -E "\[FAIL\]|\[WARN |Motivacao:|REPROVADO|DIAGNOSTICO FINAL|concluido com sucesso|concluidos com sucesso|FALHA CRITICA" "$DCGM_LOG" | sed -E 's/^\[[^]]*\] /  /'
+        grep -E "\[FAIL\]|\[WARN |Motivacao:|REPROVADO|DIAGNOSTICO FINAL|concluido com sucesso|concluidos com sucesso|FALHA CRITICA|GPU EM FALHA" "$DCGM_LOG" | sed -E 's/^\[[^]]*\] /  /'
     else
         echo "  (log do diagnostico nao encontrado)"
     fi

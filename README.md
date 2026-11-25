@@ -117,6 +117,8 @@ Arquivos gerados em `~/homologacao/relatorios/`:
 
 Se o Módulo 1 instalar o driver, o orquestrador grava um relatório **PENDENTE - REBOOT NECESSÁRIO**, avisa e reinicia o servidor. Se o driver estiver ausente e a instalação falhar, ou se o driver não responder, o resultado é **NÃO EXECUTADO** com a causa real: os demais testes não rodam, para não gerar reprovações enganosas.
 
+Se uma GPU travar no DCGM, o relatório lista a GPU em falha nos motivos e coloca as falhas seguintes (NCCL, vLLM, travamentos do `nvidia-smi`) numa seção à parte, como consequência dessa GPU, com status **AFETADO**. Cada Xid crítico do kernel é atribuído à GPU correspondente.
+
 ### Opção 2 — Manual (módulo a módulo)
 
 1. `./01_inventario.sh`: prossiga somente se o log terminar com `STATUS DO HARDWARE: SAUDAVEL` e sem nenhum `ALERTA CRITICO`.
@@ -137,7 +139,7 @@ O servidor é **REPROVADO** se ocorrer qualquer um dos itens abaixo.
 | Origem | Critério |
 |---|---|
 | Inventário | Menos de 8 GPUs no PCIe ou no driver; GPU com link PCIe abaixo da geração máxima suportada pela própria GPU (ex.: L40S = Gen4, RTX PRO 6000 Blackwell = Gen5) ou com largura menor que x16; GPU pendente de reboot (*Recovery Action*); container Docker sem acesso às 8 GPUs |
-| DCGM | Qualquer teste com `FAIL`; qualquer `WARN` maligno (ECC, Xid, throttling, PCIe, energia, desempenho abaixo do limite ou aviso não catalogado); GPU caiu do barramento |
+| DCGM | Qualquer teste com `FAIL`; qualquer `WARN` maligno (ECC, Xid, throttling, PCIe, energia, desempenho abaixo do limite ou aviso não catalogado); GPU caiu do barramento ou travou (pendente de reset) |
 | NCCL | Corrupção de dados (`#wrong` ≠ 0 ou `Out of bounds values` ≠ 0) em qualquer rodada; teste incompleto; banda abaixo de `MIN_BUSBW_GBPS` (se definido) |
 | vLLM | Falha na execução do benchmark |
 | Telemetria | GPU acima de **90 °C**; throttling térmico, HW Slowdown ou Power Brake; GPU que não atinge, sob carga, a geração PCIe máxima que ela suporta; erros ECC não corrigidos; `nvidia-smi` sem resposta |
@@ -168,7 +170,7 @@ Ficam **apenas registrados**, sem reprovar: o throughput do vLLM, a banda do NCC
 ```
 
 - Executa os níveis 1 a 4 em sequência. Os níveis 3 e 4 geram estresse intenso e podem levar horas.
-- Antes e depois de cada nível, verifica a saúde das GPUs: contagem no PCIe e no driver, *Recovery Action* e Xid crítico no `dmesg`.
+- Antes e depois de cada nível, verifica a saúde das GPUs: contagem no PCIe e no driver, *Recovery Action* e Xid crítico no `dmesg`. Se uma GPU travar, informa qual (índice, PCI e serial) e encerra com código 2.
 - Lê o JSON de cada nível e lista cada falha ou aviso com o teste, a GPU e a motivação. Avisos benignos são registrados e o teste continua. Para tratar um novo aviso como benigno, adicione o padrão na função `classify_warning`.
 - Eleva-se automaticamente para root.
 
@@ -222,6 +224,21 @@ Quando muitos pares de GPUs falham no teste `pcie` do DCGM, a causa costuma ser 
 
 Essas são mudanças de configuração no servidor do cliente: combine com ele antes de aplicar.
 
+### GPU travada durante o estresse (Xid 119/154, *Recovery Action*)
+
+O relatório identifica a GPU em falha pelo índice, endereço PCI e serial, por exemplo `GPU 1 (PCI 00000000:21:00.0, serial 1324023086915)`. Xid 119 é timeout do GSP (firmware da GPU) e Xid 154 indica que a GPU precisa de reset. Os testes que falham depois disso (NCCL, vLLM, travamentos do `nvidia-smi`) aparecem como **consequência** da GPU em falha: não são problemas independentes.
+
+Para separar defeito da GPU de problema da plataforma (slot, riser, BIOS):
+
+1. Reinicie o servidor e confirme que as 8 GPUs voltaram com `nvidia-smi`.
+2. Rode `sudo dcgmi diag -r pcie` para validar em poucos minutos.
+3. Repita o diagnóstico sem a GPU suspeita, por exemplo `sudo dcgmi diag -r 3 -i 0,2,3,4,5,6,7`.
+4. Troque a GPU suspeita de slot com outra: se a falha acompanhar a GPU, é a placa; se ficar no slot, é a plataforma.
+5. Colete `sudo nvidia-bug-report.sh` para abrir chamado com o fabricante.
+6. Confira se a BIOS e o BMC do servidor estão na versão mais recente do fabricante.
+
+Atualizações de BIOS e trocas de slot no servidor do cliente devem ser combinadas com ele.
+
 ---
 
 ## Estrutura de diretórios gerada
@@ -245,7 +262,7 @@ Essas são mudanças de configuração no servidor do cliente: combine com ele a
 |---|---|
 | `0` | Aprovado |
 | `1` | Erro de software ou de execução (teste incompleto) |
-| `2` | GPU caiu do barramento (reboot físico obrigatório). Usado pelo Módulo 2. |
+| `2` | GPU caiu do barramento ou travou e ficou pendente de reset (reboot físico obrigatório). Usado pelo Módulo 2, que identifica a GPU (índice, PCI e serial). |
 | `3` | Hardware reprovado |
 | `4` | Driver NVIDIA instalado: reboot necessário. Usado pelos Módulos 0 e 1. |
 

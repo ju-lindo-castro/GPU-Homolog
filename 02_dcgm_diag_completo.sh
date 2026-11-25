@@ -1,7 +1,7 @@
 #!/bin/bash
-# Modulo 2: Diagnostico DCGM Completo (v10 - Gatekeeper de Saude PCIe/Hardware + Execucao como root + Avaliacao do JSON FAIL/WARN + deteccao de driver ausente)
+# Modulo 2: Diagnostico DCGM Completo (v11 - Gatekeeper de Saude PCIe/Hardware + Execucao como root + Avaliacao do JSON FAIL/WARN + deteccao de driver ausente + identificacao da GPU em falha)
 # Uso: ./02_dcgm_diag_completo.sh [NIVEL_MAXIMO] (Padrao: 4. Ex: ./02_dcgm_diag_completo.sh 2)
-# Codigos de saida: 0 = aprovado | 1 = erro de software/utilitario | 2 = GPU caiu (reboot obrigatorio) | 3 = hardware reprovado no diagnostico
+# Codigos de saida: 0 = aprovado | 1 = erro de software/utilitario | 2 = GPU caiu do barramento ou travou/pendente de reset (reboot obrigatorio) | 3 = hardware reprovado no diagnostico
 
 MAX_LEVEL=${1:-4}
 # Quantidade de GPUs que o servidor deve ter (padrao da homologacao)
@@ -31,8 +31,18 @@ log() {
 # ==============================================================================
 # Gatekeeper de Hardware: Detecta GPU caida do barramento ou estado de Reboot
 # ==============================================================================
+# Identifica as GPUs marcadas para reset (indice, PCI e serial), usando o inventario do Modulo 1
+identify_recovery_gpus() {
+    nvidia-smi -q 2>/dev/null | awk -v inv="$BASE_DIR/inventario/pcie_status.txt" '
+        BEGIN { while ((getline l < inv) > 0) { split(l, a, /, */); if (a[1] ~ /^[0-9]+$/) idx[tolower(a[3])] = a[1] } }
+        /^GPU [0-9A-Fa-f]+:/ { bus = tolower($2); serial = "?" }
+        /^    Serial Number/ { s = $0; sub(/.*: */, "", s); serial = s }
+        /GPU Recovery Action/ && !/None/ { act = $0; sub(/.*: */, "", act); printf "GPU %s (PCI %s, serial %s): Recovery Action = %s\n", ((bus in idx) ? idx[bus] : "?"), bus, serial, act }'
+}
+
 check_gpu_health() {
     local fase="$1"
+    GPU_FAIL_DESC=""
     log "Verificando integridade fisica e do driver das GPUs ($fase)..."
 
     # 1. Contagem fisica no barramento PCIe (Vendor NVIDIA 10de, classes 0300/0302)
@@ -57,6 +67,7 @@ check_gpu_health() {
         log "ACAO OBRIGATORIA: Execute um REBOOT FISICO (Hard Reboot) no servidor."
         log "Nao tente reiniciar o servico DCGM antes de reiniciar a maquina."
         log "======================================================================"
+        GPU_FAIL_DESC="GPU caiu do barramento PCIe ou perdeu o device handle"
         return 1
     fi
 
@@ -66,6 +77,7 @@ check_gpu_health() {
         log "Esperadas $EXPECTED_GPUS GPUs | Barramento PCIe (lspci): $pci_count | Driver (nvidia-smi): $active_count"
         log "ACAO OBRIGATORIA: Verifique a GPU ausente (encaixe/riser, energia, BIOS) e faca um REBOOT FISICO antes de continuar."
         log "======================================================================"
+        GPU_FAIL_DESC="GPU ausente (PCIe: $pci_count, driver: $active_count, esperadas: $EXPECTED_GPUS)"
         return 1
     fi
 
@@ -75,6 +87,7 @@ check_gpu_health() {
         log "Divergencia de barramento: lspci detectou $pci_count GPUs, mas o driver so enxerga $active_count."
         log "ACAO OBRIGATORIA: Execute um REBOOT FISICO (Hard Reboot) no servidor."
         log "======================================================================"
+        GPU_FAIL_DESC="GPU visivel no PCIe mas inacessivel ao driver (PCIe: $pci_count, driver: $active_count)"
         return 1
     fi
 
@@ -82,12 +95,19 @@ check_gpu_health() {
     local recovery_status
     recovery_status=$(nvidia-smi -q 2>/dev/null | grep "GPU Recovery Action" | grep -v "None" || true)
     if [ -n "$recovery_status" ]; then
+        local failed_gpus
+        failed_gpus=$(identify_recovery_gpus)
         log "======================================================================"
-        log "FALHA CRITICA DE DRIVER/BARRAMENTO ($fase)!"
-        log "O driver NVIDIA reportou estado degradado que exige reinicializacao:"
-        echo "$recovery_status" | tee -a "$FULL_LOG"
+        log "FALHA CRITICA: GPU TRAVADA / PENDENTE DE RESET ($fase)!"
+        log "O driver NVIDIA marcou GPU(s) para reset (GPU Recovery Action diferente de None):"
+        if [ -n "$failed_gpus" ]; then
+            while IFS= read -r l; do log "  GPU EM FALHA: $l"; done <<< "$failed_gpus"
+        else
+            echo "$recovery_status" | tee -a "$FULL_LOG"
+        fi
         log "ACAO OBRIGATORIA: Execute um REBOOT FISICO (Hard Reboot) no servidor."
         log "======================================================================"
+        GPU_FAIL_DESC="GPU travada e pendente de reset (Recovery Action)${failed_gpus:+: $(echo "$failed_gpus" | sed 's/: Recovery Action = .*//' | paste -sd ';' | sed 's/;/; /g')}"
         return 1
     fi
 
@@ -99,6 +119,7 @@ check_gpu_health() {
         echo "$kernel_fatal" | tee -a "$FULL_LOG"
         if echo "$kernel_fatal" | grep -qiE "fallen off the bus|Xid.*: 79"; then
             log "ACAO OBRIGATORIA: GPU caiu do barramento (Xid 79). Reinicie o servidor antes de continuar."
+            GPU_FAIL_DESC="GPU caiu do barramento PCIe (Xid 79)"
             return 1
         fi
     fi
@@ -262,6 +283,7 @@ for LEVEL in $(seq 1 "$MAX_LEVEL"); do
             log "=================================================="
             log "REPROVADO NO NIVEL $LEVEL: $DIAG_FAILS falha(s) e $DIAG_MALIGN aviso(s) maligno(s). Detalhes acima e em: $OUTPUT_FILE"
             if ! check_gpu_health "Pos-Reprovacao Nivel $LEVEL"; then
+                log "DIAGNOSTICO FINAL: O Nivel $LEVEL reprovou e deixou GPU(s) em falha: ${GPU_FAIL_DESC:-estado de GPU degradado}."
                 exit 2
             fi
             log "DIAGNOSTICO FINAL: Hardware reprovado no diagnostico DCGM (GPUs ainda visiveis no barramento)."
@@ -274,7 +296,7 @@ for LEVEL in $(seq 1 "$MAX_LEVEL"); do
         log "ERRO: dcgmi retornou codigo $DIAG_RC no Nivel $LEVEL sem falhas de teste identificaveis no JSON (JSON valido: $JSON_OK)."
         log "Output parcial salvo em: $OUTPUT_FILE"
         if ! check_gpu_health "Pos-Falha Nivel $LEVEL"; then
-            log "DIAGNOSTICO FINAL: O Nivel $LEVEL causou queda de GPU no barramento PCIe."
+            log "DIAGNOSTICO FINAL: O Nivel $LEVEL deixou GPU(s) em falha: ${GPU_FAIL_DESC:-estado de GPU degradado}."
             log "Nao re-execute o script sem antes fazer um Reboot completo no servidor."
             exit 2
         fi
@@ -290,6 +312,7 @@ for LEVEL in $(seq 1 "$MAX_LEVEL"); do
 
     # 3. Mesmo com o teste aprovado, valida se nenhuma GPU entrou em estado de Reboot durante o teste
     if ! check_gpu_health "Pos-Nivel $LEVEL"; then
+        log "DIAGNOSTICO FINAL: O Nivel $LEVEL deixou GPU(s) em falha: ${GPU_FAIL_DESC:-estado de GPU degradado}."
         exit 2
     fi
 
