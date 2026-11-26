@@ -1,6 +1,7 @@
 #!/bin/bash
-# Modulo 1: Inventario e Preparacao do Ambiente (v14 - Driver NVIDIA automatico, DCGM 4, CUDA/NCCL alinhados ao driver, Docker/NVIDIA Container Toolkit, Auditoria PCIe e de GPUs)
-# Codigos de saida: 0 = concluido | 1 = falha critica | 4 = driver NVIDIA instalado, reboot necessario
+# Modulo 1: Inventario e Preparacao do Ambiente (v15 - Driver NVIDIA automatico, Fabric Manager (NVSwitch), reparo do sistema de pacotes, DCGM 4, CUDA/NCCL alinhados ao driver, Docker/NVIDIA Container Toolkit, Auditoria PCIe e de GPUs)
+# Codigos de saida: 0 = concluido | 1 = falha critica ou servidor em uso | 4 = driver NVIDIA (ou driver + Fabric Manager) instalado, reboot necessario
+# ATENCAO: altera o sistema (pacotes, servicos, kernel e reboot). Use somente em servidor dedicado ao teste.
 
 BASE_DIR="$HOME/homologacao"
 mkdir -p "$BASE_DIR"/{inventario,dcgm,stress,benchmark,logs}
@@ -15,9 +16,62 @@ log() {
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
-log "--- Iniciando Script de Inventario (v14) ---"
+log "--- Iniciando Script de Inventario (v15) ---"
 
-# 0. Correcao para imagens limpas (Minimal/Server) do Ubuntu
+# ==============================================================================
+# Trava de seguranca: o GPU-Homolog altera o sistema (pacotes, servicos, kernel e reboot)
+# e so deve rodar em servidor dedicado ao teste. Aborta se as GPUs ou o Docker estiverem em uso.
+# Para ignorar (por sua conta e risco): HOMOLOG_IGNORAR_TRAVA=1
+# ==============================================================================
+if [ -z "${HOMOLOG_IGNORAR_TRAVA:-}" ]; then
+    GPU_APPS=""
+    command -v nvidia-smi &> /dev/null && GPU_APPS=$(timeout 30 nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader 2>/dev/null | grep -v '^ *$' | tr '\n' ';')
+    RUNNING_CTRS=""
+    command -v docker &> /dev/null && RUNNING_CTRS=$(sudo docker ps -q 2>/dev/null | wc -l | tr -d ' ')
+    if [ -n "$GPU_APPS" ] || [ "${RUNNING_CTRS:-0}" -gt 0 ]; then
+        log "NAO EXECUTADO: servidor em uso (processos nas GPUs: ${GPU_APPS:-nenhum} | containers ativos: ${RUNNING_CTRS:-0}). O GPU-Homolog altera o sistema e so deve rodar em servidor dedicado ao teste. Para ignorar a trava: HOMOLOG_IGNORAR_TRAVA=1."
+        exit 1
+    fi
+fi
+
+# ==============================================================================
+# Preparacao do sistema de pacotes (Ubuntu limpo)
+# ==============================================================================
+PKG_BROKEN=false
+
+# Mensagem de erro de instalacao: a causa (linhas de erro), nao apenas o fim do log
+pkg_err() {
+    local f="$1" e
+    if [ "$PKG_BROKEN" = true ]; then
+        echo "sistema de pacotes quebrado (ver AVISO DE SOFTWARE no inicio do log)"
+        return
+    fi
+    e=$(grep -iE "^E:|error|erro|failed|falh" "$f" 2>/dev/null | grep -v "^ *$" | head -n 3 | tr '\n' ' ' | head -c 400)
+    [ -z "$e" ] && e=$(tr '\n' ' ' < "$f" 2>/dev/null | tail -c 250)
+    echo "$e"
+}
+
+# Pacotes com instalacao pendente ou com erro (estados diferentes de ii/rc)
+broken_packages() {
+    dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' 2>/dev/null | awk '$1 !~ /^(ii|rc|un|pn|hi)$/ {print $2}'
+}
+
+# 1. Atualizacoes automaticas do Ubuntu: travam o apt e instalam kernel novo no meio do teste
+log "Etapa: Desativacao das atualizacoes automaticas (unattended-upgrades/apt-daily) - Iniciado"
+for unit in unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service; do
+    sudo systemctl stop "$unit" &>/dev/null || true
+    sudo systemctl disable "$unit" &>/dev/null || true
+done
+log "Etapa: Desativacao das atualizacoes automaticas - Finalizado"
+
+# 2. Aguarda o fim de instalacoes em andamento (ate APT_LOCK_WAIT segundos)
+APT_LOCK_WAIT=600
+waited=0
+while pgrep -x "apt|apt-get|dpkg|unattended-upgr|aptd" &>/dev/null && [ "$waited" -lt "$APT_LOCK_WAIT" ]; do
+    [ "$waited" -eq 0 ] && log "Etapa: Sistema de pacotes - aguardando o fim de uma instalacao em andamento (ate ${APT_LOCK_WAIT}s)..."
+    sleep 10; waited=$((waited + 10))
+done
+
 log "Etapa: Preparacao base do sistema (apt-utils e correcao Java/Manpages) - Iniciado"
 sudo apt-get update -y &>/dev/null || true
 
@@ -29,9 +83,57 @@ if [ ! -d "/usr/share/man/man1" ]; then
     sudo mkdir -p /usr/share/man/man1
 fi
 
-sudo DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y &>/dev/null || true
-sudo DEBIAN_FRONTEND=noninteractive dpkg --configure -a &>/dev/null || true
+# 3. Conclui instalacoes interrompidas, registrando a saida completa
+PKG_LOG="$BASE_DIR/inventario/pacotes_reparo.log"
+{
+    echo "### dpkg --configure -a"; sudo DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1
+    echo "### apt-get --fix-broken install"; sudo DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y 2>&1
+} > "$PKG_LOG"
 log "Etapa: Preparacao base do sistema - Finalizado"
+
+# 4. Se continuar quebrado: pacotes de um kernel mais novo que o em uso sao removidos e o
+#    kernel e travado (o servidor segue no kernel atual, onde o driver NVIDIA funciona).
+BROKEN=$(broken_packages)
+if [ -n "$BROKEN" ]; then
+    RUNNING_KVER=$(uname -r)
+    log "Etapa: Reparo do sistema de pacotes - Pacotes com erro: $(echo "$BROKEN" | tr '\n' ' ')"
+    KERNEL_BROKEN=""; OTHER_BROKEN=""
+    for p in $BROKEN; do
+        if [[ "$p" =~ ^linux-(image|headers|modules|modules-extra|signed-image|tools|cloud-tools|objects|signatures|generic|image-generic|headers-generic)(-|$) ]] && [[ "$p" != *"$RUNNING_KVER"* ]]; then
+            KERNEL_BROKEN="$KERNEL_BROKEN $p"
+        else
+            OTHER_BROKEN="$OTHER_BROKEN $p"
+        fi
+    done
+    if [ -n "$KERNEL_BROKEN" ] && [ -z "$OTHER_BROKEN" ]; then
+        # Evidencia da causa (normalmente a compilacao do modulo NVIDIA via DKMS para o kernel novo)
+        {
+            echo "### Kernel em uso: $RUNNING_KVER | Pacotes de kernel com erro:$KERNEL_BROKEN"
+            echo "### dkms status"; dkms status 2>&1
+            for mk in /var/lib/dkms/*/*/*/*/log/make.log /var/lib/dkms/*/*/build/make.log; do
+                [ -f "$mk" ] && { echo "### $mk (ultimas linhas)"; tail -n 30 "$mk"; }
+            done
+        } >> "$PKG_LOG" 2>&1
+        DKMS_ERR=$(dkms status 2>/dev/null | grep -iE "error|fail|broken|warning" | head -n 2 | tr '\n' ' ')
+        log "Etapa: Reparo do sistema de pacotes - Kernel diferente do em uso ($RUNNING_KVER) com instalacao quebrada${DKMS_ERR:+ (DKMS: $DKMS_ERR)}. Removendo:$KERNEL_BROKEN"
+        if sudo DEBIAN_FRONTEND=noninteractive apt-get purge -y $KERNEL_BROKEN >> "$PKG_LOG" 2>&1 \
+            || sudo DEBIAN_FRONTEND=noninteractive dpkg --purge --force-depends $KERNEL_BROKEN >> "$PKG_LOG" 2>&1; then
+            # Trava os metapacotes do kernel para nao reinstalar o kernel novo durante o teste
+            KMETA=$(dpkg-query -W -f='${Package}\n' 'linux-generic*' 'linux-image-generic*' 'linux-headers-generic*' 2>/dev/null)
+            [ -n "$KMETA" ] && sudo apt-mark hold $KMETA >> "$PKG_LOG" 2>&1
+            sudo DEBIAN_FRONTEND=noninteractive dpkg --configure -a >> "$PKG_LOG" 2>&1
+            sudo DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y >> "$PKG_LOG" 2>&1
+        fi
+    fi
+    BROKEN=$(broken_packages)
+    if [ -n "$BROKEN" ]; then
+        PKG_BROKEN=true
+        CAUSE=$(grep -iE "^E:|error processing|dpkg: error|erro ao processar|returned error" "$PKG_LOG" | grep -v "^ *$" | head -n 2 | tr '\n' ' ' | head -c 300)
+        log "AVISO DE SOFTWARE: sistema de pacotes quebrado; instalacoes via apt vao falhar (CUDA, NCCL, Docker etc.). Pacotes com erro: $(echo "$BROKEN" | tr '\n' ' ')| Causa: ${CAUSE:-ver $PKG_LOG}"
+    else
+        log "Etapa: Reparo do sistema de pacotes - Finalizado (sistema de pacotes consistente; detalhes em $PKG_LOG)"
+    fi
+fi
 
 check_and_install() {
     local cmd="$1"
@@ -43,7 +145,7 @@ check_and_install() {
         if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" &>/tmp/err_install_${cmd}.log; then
             log "Etapa: Verificacao da ferramenta '$cmd' - Finalizado (Instalado com sucesso)"
         else
-            ERR=$(tr '\n' ' ' < /tmp/err_install_${cmd}.log | sed 's/ *$//' | tail -c 250)
+            ERR=$(pkg_err /tmp/err_install_${cmd}.log)
             log "Etapa: Verificacao da ferramenta '$cmd' - Erro: Falha na instalacao: $ERR"
         fi
     else
@@ -126,13 +228,140 @@ else
         log "Etapa: Instalacao do driver NVIDIA (open kernel modules) - Finalizado (instalado com sucesso)"
         request_reboot "o driver NVIDIA acabou de ser instalado e so passa a funcionar apos reiniciar o servidor."
     else
-        ERR=$(tr '\n' ' ' < /tmp/err_driver_install.log | tail -c 250)
+        ERR=$(pkg_err /tmp/err_driver_install.log)
         log "Etapa: Instalacao do driver NVIDIA (open kernel modules) - Erro: $ERR"
         log "Falha Critica: nao foi possivel instalar o driver NVIDIA automaticamente. Instale-o manualmente e reinicie o servidor. Abortando."
         exit 1
     fi
 fi
 
+
+# ==============================================================================
+# Fabric Manager: obrigatorio em servidores com NVSwitch (HGX/DGX SXM: H100/H200/B300 SXM).
+# Sem ele o CUDA nao inicializa ("system not yet initialized", erro 802).
+# A versao do Fabric Manager deve ser a mesma do driver; no Blackwell ele usa tambem o NVLSM.
+# ==============================================================================
+FM_WAIT_MAX=600                                   # segundos maximos aguardando o fabric concluir
+FM_MARKER="/var/lib/gpu-homolog/fm_realinhamento" # evita repetir o realinhamento driver + FM em loop
+IS_NVSWITCH=false
+
+# Uma linha "Estado|Status" por GPU, lida da secao Fabric do nvidia-smi -q
+fabric_states() {
+    timeout 60 nvidia-smi -q 2>/dev/null | awk '
+        /^    Fabric *$/ { f = 1; next }
+        f && /^        State/  { s = $0; sub(/.*: */, "", s) }
+        f && /^        Status/ { t = $0; sub(/.*: */, "", t); print s "|" t; f = 0 }'
+}
+fabric_ready() {
+    local st
+    st=$(fabric_states)
+    [ -n "$st" ] && ! echo "$st" | grep -qv "^Completed|Success$"
+}
+# Versao do Fabric Manager instalado (vazio se ausente)
+fm_version() {
+    command -v nv-fabricmanager &> /dev/null || return 0
+    nv-fabricmanager --version 2>/dev/null | grep -oE "[0-9]+\.[0-9]+(\.[0-9]+)?" | head -n1
+}
+# Versao de um pacote no repositorio cuja versao do upstream e exatamente $2 (ex.: 580.65.06-1)
+repo_version_for() {
+    apt-cache madison "$1" 2>/dev/null | awk -F'|' '{gsub(/ /, "", $2); print $2}' | grep -E "^([0-9]+:)?$2(-|$)" | head -n1
+}
+repo_has() { apt-cache show "$1" &>/dev/null; }
+
+if command -v nvidia-smi &> /dev/null && timeout 30 nvidia-smi -L &> /dev/null \
+    && fabric_states | grep -qv "^N/A|"; then
+    IS_NVSWITCH=true
+fi
+
+if [ "$IS_NVSWITCH" = true ]; then
+    log "Etapa: Fabric Manager (servidor com NVSwitch) - Iniciado"
+    DRV_VER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 | tr -d ' ')
+    DRV_BRANCH="${DRV_VER%%.*}"
+    CC_MAJOR=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n1 | cut -d. -f1 | tr -d ' ')
+    BLACKWELL=false; [ "${CC_MAJOR:-0}" -ge 10 ] 2>/dev/null && BLACKWELL=true
+
+    if fabric_ready; then
+        FMV=$(fm_version); log "Etapa: Fabric Manager - Finalizado (fabric concluido nas GPUs; Fabric Manager ${FMV:-versao nao identificada})"
+    else
+        log "Etapa: Fabric Manager - Fabric nao concluido (estado: $(fabric_states | sort | uniq -c | tr -s ' ' | tr '\n' ';')). Driver $DRV_VER, Fabric Manager instalado: $(fm_version)"
+        # Pacotes complementares: NSCQ (monitoramento pelo DCGM) e, no Blackwell, NVSDM e NVLSM
+        FM_EXTRA=""
+        for p in libnvidia-nscq libnvidia-nscq-$DRV_BRANCH; do repo_has "$p" && { FM_EXTRA="$p"; break; }; done
+        if [ "$BLACKWELL" = true ]; then
+            for p in libnvsdm nvlsm; do repo_has "$p" && FM_EXTRA="$FM_EXTRA $p"; done
+        fi
+
+        # 1. Instala o Fabric Manager na versao do driver (a partir do branch 620 ele e lancado separado do driver)
+        INST_FM="$(fm_version)"
+        if [ -z "$INST_FM" ] || { [ "$DRV_BRANCH" -lt 620 ] 2>/dev/null && [ "$INST_FM" != "$DRV_VER" ]; }; then
+            FM_SPEC=""
+            if [ "$DRV_BRANCH" -ge 620 ] 2>/dev/null; then
+                FM_SPEC="nvidia-fabricmanager"
+            else
+                for p in nvidia-fabricmanager nvidia-fabricmanager-$DRV_BRANCH; do
+                    v=$(repo_version_for "$p" "$DRV_VER")
+                    [ -n "$v" ] && { FM_SPEC="$p=$v"; break; }
+                done
+                # Biblioteca NSCQ na mesma versao, quando houver
+                if [ -n "$FM_SPEC" ]; then
+                    for p in $FM_EXTRA; do
+                        if [[ "$p" == libnvidia-nscq* ]]; then
+                            v=$(repo_version_for "$p" "$DRV_VER")
+                            [ -n "$v" ] && FM_EXTRA="${FM_EXTRA/$p/$p=$v}"
+                        fi
+                    done
+                fi
+            fi
+            if [ -n "$FM_SPEC" ]; then
+                log "Etapa: Fabric Manager - Instalando $FM_SPEC $FM_EXTRA"
+                if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades $FM_SPEC $FM_EXTRA &>/tmp/err_fm_install.log; then
+                    log "Etapa: Fabric Manager - Instalado (versao $(fm_version))"
+                else
+                    log "Etapa: Fabric Manager - Erro: Falha na instalacao: $(pkg_err /tmp/err_fm_install.log)"
+                fi
+            elif [ ! -f "$FM_MARKER" ]; then
+                # 2. Sem Fabric Manager para este driver (ex.: driver de outra fonte): realinha driver + FM e reinicia
+                log "Etapa: Fabric Manager - Nao ha Fabric Manager $DRV_VER no repositorio. Realinhando driver e Fabric Manager pelo repositorio NVIDIA (branch $DRV_BRANCH)..."
+                sudo mkdir -p "$(dirname "$FM_MARKER")" && sudo touch "$FM_MARKER"
+                repo_has "nvidia-driver-pinning-$DRV_BRANCH" && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "nvidia-driver-pinning-$DRV_BRANCH" &>/tmp/err_fm_realign.log
+                if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades nvidia-open nvidia-fabricmanager $FM_EXTRA &>>/tmp/err_fm_realign.log; then
+                    sudo systemctl enable nvidia-fabricmanager &>/dev/null || true
+                    request_reboot "driver NVIDIA e Fabric Manager foram realinhados na mesma versao e so passam a funcionar apos reiniciar o servidor."
+                else
+                    log "Etapa: Fabric Manager - Erro: falha ao realinhar driver e Fabric Manager: $(pkg_err /tmp/err_fm_realign.log)"
+                fi
+            else
+                log "Etapa: Fabric Manager - Erro: o realinhamento de driver e Fabric Manager ja foi tentado e a versao continua divergente (driver $DRV_VER, Fabric Manager ${INST_FM:-ausente})."
+            fi
+        elif [ -n "$FM_EXTRA" ]; then
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y $FM_EXTRA &>/tmp/err_fm_extra.log \
+                || log "Etapa: Fabric Manager - Aviso: falha ao instalar componentes ($FM_EXTRA): $(pkg_err /tmp/err_fm_extra.log)"
+        fi
+
+        # 3. Ativa (ou reinicia) o servico e aguarda o treinamento do NVLink
+        if [ -n "$(fm_version)" ]; then
+            if systemctl is-active --quiet nvidia-fabricmanager; then
+                sudo systemctl restart nvidia-fabricmanager &>/dev/null
+            else
+                sudo systemctl enable --now nvidia-fabricmanager &>/dev/null
+            fi
+            waited=0
+            while ! fabric_ready && [ "$waited" -lt "$FM_WAIT_MAX" ]; do
+                sleep 10; waited=$((waited + 10))
+                # Servico em falha: nao adianta esperar o tempo todo
+                if [ "$waited" -ge 30 ] && systemctl is-failed --quiet nvidia-fabricmanager; then break; fi
+            done
+        fi
+
+        if fabric_ready; then
+            sudo rm -f "$FM_MARKER"
+            log "Etapa: Fabric Manager - Finalizado (fabric concluido; Fabric Manager $(fm_version), driver $DRV_VER)"
+        else
+            FM_LOG_TAIL=$( { journalctl -u nvidia-fabricmanager -b --no-pager -n 4 2>/dev/null; tail -n 3 /var/log/fabricmanager.log 2>/dev/null; } | tr '\n' ' ' | tr -s ' ' | tail -c 400)
+            log "NAO EXECUTADO: Fabric Manager nao concluiu o treinamento do NVLink (estado: $(fabric_states | sort -u | tr '\n' ' '); driver $DRV_VER; Fabric Manager ${INST_FM:-ausente} -> $(v=$(fm_version); echo "${v:-ausente}"); servico: $(systemctl is-active nvidia-fabricmanager 2>/dev/null || true)). Sem o fabric o CUDA nao inicializa e os testes dariam falsas reprovacoes. Log: ${FM_LOG_TAIL:-sem registros}"
+        fi
+    fi
+fi
 
 # ==============================================================================
 # CUDA Toolkit (versao alinhada ao driver; minimo 12.8 para Blackwell) + NCCL
@@ -148,7 +377,7 @@ if dpkg -s nvidia-cuda-toolkit &>/dev/null; then
     if sudo DEBIAN_FRONTEND=noninteractive apt-get remove -y nvidia-cuda-toolkit &>/tmp/err_remove_cuda.log; then
         log "Etapa: Remocao do nvidia-cuda-toolkit do Ubuntu - Finalizado"
     else
-        ERR=$(tr '\n' ' ' < /tmp/err_remove_cuda.log | tail -c 250)
+        ERR=$(pkg_err /tmp/err_remove_cuda.log)
         log "Etapa: Remocao do nvidia-cuda-toolkit do Ubuntu - Erro: $ERR"
     fi
 fi
@@ -186,7 +415,7 @@ else
         elif sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$CUDA_PKG" &>/tmp/err_cuda_install.log; then
             log "Etapa: Instalacao do CUDA Toolkit - Finalizado ($CUDA_PKG instalado com sucesso)"
         else
-            ERR=$(tr '\n' ' ' < /tmp/err_cuda_install.log | tail -c 250)
+            ERR=$(pkg_err /tmp/err_cuda_install.log)
             log "Etapa: Instalacao do CUDA Toolkit - Erro: Falha na instalacao de $CUDA_PKG: $ERR"
             CUDA_VER=""
         fi
@@ -213,7 +442,7 @@ if [ -n "$CUDA_VER" ]; then
     elif sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades "libnccl2=$NCCL_VER" "libnccl-dev=$NCCL_VER" &>/tmp/err_nccl_install.log; then
         log "Etapa: Instalacao da NCCL - Finalizado ($NCCL_VER instalada com sucesso)"
     else
-        ERR=$(tr '\n' ' ' < /tmp/err_nccl_install.log | tail -c 250)
+        ERR=$(pkg_err /tmp/err_nccl_install.log)
         log "Etapa: Instalacao da NCCL - Erro: Falha na instalacao de $NCCL_VER: $ERR"
     fi
 fi
@@ -236,7 +465,7 @@ else
         if sudo DEBIAN_FRONTEND=noninteractive apt-get purge -y datacenter-gpu-manager datacenter-gpu-manager-config &>/tmp/err_dcgm_purge.log; then
             log "Etapa: Migracao do DCGM 3.x para o DCGM 4 - DCGM 3.x removido"
         else
-            ERR=$(tr '\n' ' ' < /tmp/err_dcgm_purge.log | tail -c 250)
+            ERR=$(pkg_err /tmp/err_dcgm_purge.log)
             log "Etapa: Migracao do DCGM 3.x para o DCGM 4 - Aviso: falha ao remover o DCGM 3.x: $ERR"
         fi
     fi
@@ -247,7 +476,7 @@ else
         sudo systemctl enable --now nvidia-dcgm &>/dev/null || true
         log "Etapa: Verificacao de instalacao do DCGM 4 ($DCGM_PKG) - Finalizado (Instalado com sucesso)"
     else
-        ERR=$(tr '\n' ' ' < /tmp/err_dcgm_install.log | tail -c 250)
+        ERR=$(pkg_err /tmp/err_dcgm_install.log)
         log "Etapa: Verificacao de instalacao do DCGM 4 ($DCGM_PKG) - Erro: Falha na instalacao: $ERR"
     fi
 fi
@@ -293,7 +522,7 @@ if ! command -v docker &> /dev/null; then
     if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io &>/tmp/err_docker_install.log; then
         log "Etapa: Verificacao do Docker - Finalizado (Instalado com sucesso)"
     else
-        ERR=$(tr '\n' ' ' < /tmp/err_docker_install.log | tail -c 250)
+        ERR=$(pkg_err /tmp/err_docker_install.log)
         log "Etapa: Verificacao do Docker - Erro: Falha na instalacao: $ERR"
     fi
 else
@@ -322,7 +551,7 @@ if ! command -v nvidia-ctk &> /dev/null; then
     elif sudo DEBIAN_FRONTEND=noninteractive apt-get install -y $CTK_PKGS &>>/tmp/err_ctk_install.log; then
         log "Etapa: Verificacao do NVIDIA Container Toolkit (nvidia-ctk) - Aviso: versao $NVIDIA_CTK_VERSION indisponivel no repositorio; instalada a versao mais recente."
     else
-        ERR=$(tr '\n' ' ' < /tmp/err_ctk_install.log | tail -c 250)
+        ERR=$(pkg_err /tmp/err_ctk_install.log)
         log "Etapa: Verificacao do NVIDIA Container Toolkit (nvidia-ctk) - Erro: Falha na instalacao: $ERR"
     fi
 else
@@ -338,7 +567,7 @@ if command -v docker &> /dev/null && command -v nvidia-ctk &> /dev/null; then
     elif sudo nvidia-ctk runtime configure --runtime=docker &>/tmp/err_ctk_config.log && sudo systemctl restart docker &>>/tmp/err_ctk_config.log; then
         log "Etapa: Configuracao do runtime NVIDIA no Docker - Finalizado (Configurado e Docker reiniciado)"
     else
-        ERR=$(tr '\n' ' ' < /tmp/err_ctk_config.log | tail -c 250)
+        ERR=$(pkg_err /tmp/err_ctk_config.log)
         log "Etapa: Configuracao do runtime NVIDIA no Docker - Erro: $ERR"
     fi
 
@@ -390,6 +619,10 @@ collect_data "Coleta Status PCIe" "nvidia-smi --query-gpu=index,name,pci.bus_id,
 if command -v dcgmi &> /dev/null; then
     collect_data "Coleta DCGM Discovery" "sudo dcgmi discovery -l" "$BASE_DIR/inventario/dcgm-discovery.txt"
     collect_data "Coleta DCGM Version" "dcgmi --version; dpkg -l 'datacenter-gpu-manager*' | grep '^ii'" "$BASE_DIR/inventario/dcgm-version.txt"
+fi
+
+if [ "$IS_NVSWITCH" = true ]; then
+    collect_data "Coleta Fabric Manager" "nvidia-smi -q | grep -A 4 '^    Fabric'; echo; nv-fabricmanager --version; dpkg -l | grep -E 'fabricmanager|nvlsm|nvsdm|nscq|nvidia-open|nvidia-driver-pinning'; echo; systemctl status nvidia-fabricmanager --no-pager -n 20" "$BASE_DIR/inventario/fabricmanager.txt"
 fi
 
 if [ -x /usr/local/cuda/bin/nvcc ]; then
@@ -460,7 +693,11 @@ if [ -n "$(ls -A /sys/kernel/iommu_groups 2>/dev/null)" ]; then
 fi
 log "IOMMU: $IOMMU_MODE | Kernel cmdline: $(cat /proc/cmdline 2>/dev/null)"
 if [[ "$IOMMU_MODE" == traducao* ]]; then
-    log "AVISO DE PLATAFORMA: IOMMU em modo de traducao. Em servidores bare-metal, o P2P entre GPUs pode falhar ou corromper dados. Recomendacao: adicionar iommu=pt ao GRUB_CMDLINE_LINUX e reiniciar, ou desligar o IOMMU na BIOS se o servidor nao usa virtualizacao com passthrough."
+    if [ "$IS_NVSWITCH" = true ]; then
+        log "AVISO DE PLATAFORMA: IOMMU em modo de traducao. Neste servidor o P2P entre GPUs passa pelo NVLink (nao e afetado), mas o GPUDirect RDMA entre GPUs e placas de rede pode perder desempenho ou falhar. Recomendacao: adicionar iommu=pt ao GRUB_CMDLINE_LINUX e reiniciar."
+    else
+        log "AVISO DE PLATAFORMA: IOMMU em modo de traducao. Em servidores bare-metal, o P2P entre GPUs pode falhar ou corromper dados. Recomendacao: adicionar iommu=pt ao GRUB_CMDLINE_LINUX e reiniciar, ou desligar o IOMMU na BIOS se o servidor nao usa virtualizacao com passthrough."
+    fi
 fi
 
 # ==============================================================================

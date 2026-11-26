@@ -1,9 +1,11 @@
 #!/bin/bash
-# Modulo 0: Orquestrador da Homologacao (v7 - execucao direto do GitHub + instalacao do driver com reboot + PCIe pelo maximo da GPU + diagnostico de P2P/IOMMU + GPU em falha e consequencias + DCGM em triagem/estresse + linha do tempo)
+# Modulo 0: Orquestrador da Homologacao (v8 - plataforma nao pronta e configuracao separadas de hardware (INCONCLUSIVO) + eventos do BMC + execucao direto do GitHub + instalacao do driver com reboot + PCIe pelo maximo da GPU + diagnostico de P2P/IOMMU + GPU em falha e consequencias + DCGM em triagem/estresse + linha do tempo)
 # Executa os modulos no fluxo recomendado: inventario, telemetria, DCGM triagem (niveis 1-2), NCCL,
 # vLLM e DCGM estresse (niveis 3-4). Uma falha de teste nao interrompe a bateria; so quando uma GPU
 # entra em falha (travada ou fora do barramento) as etapas seguintes deixam de ser executadas.
-# Ao final gera o relatorio APROVADO/REPROVADO, com linha do tempo, e um pacote de todos os arquivos.
+# Ao final gera o relatorio APROVADO/REPROVADO/INCONCLUSIVO, com linha do tempo, e um pacote de todos os arquivos.
+# ATENCAO: altera o sistema (pacotes, servicos, kernel e reboot). Use somente em servidor dedicado ao teste,
+# reinstalado antes e depois da homologacao.
 # Se os modulos 01-05 nao estiverem no mesmo diretorio, baixa-os do repositorio GitHub.
 # Se o driver NVIDIA estiver ausente, o Modulo 1 o instala e o servidor e REINICIADO (com aviso);
 # depois do reboot, basta executar o mesmo comando novamente.
@@ -120,6 +122,7 @@ STAGES=()
 MOTIVOS=()
 AVISOS=()
 CONSEQ=()          # etapas e falhas causadas por uma GPU que ja estava em falha (nao sao problemas independentes)
+PENDENCIAS=()      # etapas nao executadas por configuracao do ambiente (nao avaliam o hardware)
 GPU_FAILED=false
 FAIL_STAGE=""      # etapa em que a GPU entrou em falha (falha primaria)
 FAIL_EPOCH=""      # quando a falha foi detectada
@@ -154,6 +157,14 @@ skip_stage() {
     STAGES+=("$id"); ST_DESC[$id]="$desc"; ST_STATUS[$id]="NAO EXECUTADO"; ST_DUR[$id]=0
     CONSEQ+=("$desc: nao executado porque a GPU entrou em falha na etapa $FAIL_STAGE (${ST_DESC[$FAIL_STAGE]}).")
     log "ETAPA $id: $desc - NAO EXECUTADA (GPU em falha desde a etapa $FAIL_STAGE)"
+}
+
+# Etapa nao executada por configuracao do ambiente (pacote ausente, token sem acesso etc.): nao avalia o hardware
+skip_config_stage() {
+    local id="$1" desc="$2" motivo="$3"
+    STAGES+=("$id"); ST_DESC[$id]="$desc"; ST_STATUS[$id]="NAO EXECUTADO"; ST_DUR[$id]=0
+    PENDENCIAS+=("$desc: $motivo")
+    log "ETAPA $id: $desc - NAO EXECUTADA ($motivo)"
 }
 
 # Verifica a saude das GPUs depois de uma etapa (Modulo 2 --health). Retorna 1 se uma GPU entrou em falha.
@@ -191,7 +202,14 @@ eval_dcgm() {
                iommu=$(grep -m1 -oE "IOMMU: [^|]+" "$INV_LOG" 2>/dev/null | sed 's/ *$//')
                MOTIVOS+=("$name: $p2p falha(s) de P2P (dados corrompidos entre GPUs). Causa mais comum: IOMMU em modo de traducao ou ACS, nao uma GPU com defeito (${iommu:-IOMMU: nao verificado}). Recomendacao: iommu=pt no kernel ou IOMMU desligado na BIOS; depois validar com 'sudo dcgmi diag -r pcie'.")
            fi ;;
-        *) ST_STATUS[$id]="FALHOU"; MOTIVOS+=("$name: erro de software/utilitario (codigo $rc); diagnostico incompleto.") ;;
+        *) # Plataforma nao pronta (Fabric Manager / CUDA sem inicializar): o hardware nao foi avaliado
+           diag=$(grep -m1 -oE "PLATAFORMA NAO PRONTA[^:]*: .*" "$dlog" 2>/dev/null | sed -E 's/^[^:]*: //')
+           if [ -n "$diag" ]; then
+               ST_STATUS[$id]="NAO EXECUTADO"
+               PENDENCIAS+=("$name: plataforma nao pronta, hardware nao avaliado ($diag).")
+           else
+               ST_STATUS[$id]="FALHOU"; MOTIVOS+=("$name: erro de software/utilitario (codigo $rc); diagnostico incompleto.")
+           fi ;;
     esac
 }
 
@@ -211,7 +229,9 @@ log "--- Homologacao iniciada em $HOST ---"
 run_stage 1 "Inventario e auditoria de hardware" ./01_inventario.sh
 RC=$?
 INV_LOG="$BASE_DIR/01_inventario_log_de_execucao.txt"
-INV_ALERTS=$(grep "ALERTA CRITICO" "$INV_LOG" 2>/dev/null | sed -E 's/^\[[^]]*\] //')
+# Alertas de software/container sao configuracao do ambiente (pendencias); os demais sao de hardware
+INV_ALERTS=$(grep "ALERTA CRITICO" "$INV_LOG" 2>/dev/null | grep -vE "ALERTA CRITICO DE (SOFTWARE|CONTAINER)" | sed -E 's/^\[[^]]*\] //')
+while IFS= read -r a; do [ -n "$a" ] && PENDENCIAS+=("Inventario: $a"); done < <(grep -E "ALERTA CRITICO DE (SOFTWARE|CONTAINER)" "$INV_LOG" 2>/dev/null | sed -E 's/^\[[^]]*\] //')
 if [ "$RC" -ne 0 ]; then
     ST_STATUS[1]="FALHOU"; MOTIVOS+=("Inventario: o modulo terminou com codigo $RC (ver log).")
 elif [ -n "$INV_ALERTS" ]; then
@@ -220,7 +240,8 @@ elif [ -n "$INV_ALERTS" ]; then
 else
     ST_STATUS[1]="APROVADO"
 fi
-while IFS= read -r e; do [ -n "$e" ] && AVISOS+=("Inventario: $e"); done < <(grep -E " - Erro:| - Aviso:|AVISO DE PLATAFORMA" "$INV_LOG" 2>/dev/null | sed -E 's/^\[[^]]*\] //')
+# Com o sistema de pacotes quebrado, os erros de cada instalacao repetem a mesma causa: fica so o aviso principal
+while IFS= read -r e; do [ -n "$e" ] && AVISOS+=("Inventario: $e"); done < <(grep -E " - Erro:| - Aviso:|AVISO DE PLATAFORMA|AVISO DE SOFTWARE" "$INV_LOG" 2>/dev/null | grep -v "sistema de pacotes quebrado (ver AVISO" | sed -E 's/^\[[^]]*\] //')
 
 # Relatorio curto para execucoes interrompidas antes dos testes (driver pendente ou ausente)
 short_report() {
@@ -259,6 +280,14 @@ if [ "$RC" -eq 4 ]; then
     exit 4
 fi
 
+# Servidor em uso ou plataforma nao pronta (ex.: Fabric Manager sem concluir): os testes dariam falsas reprovacoes
+INV_NAO_EXEC=$(grep -m1 "NAO EXECUTADO:" "$INV_LOG" 2>/dev/null | sed -E 's/^\[[^]]*\] //; s/^NAO EXECUTADO: //')
+if [ -n "$INV_NAO_EXEC" ]; then
+    short_report "NAO EXECUTADO" "$INV_NAO_EXEC"
+    rm -f "$STAMP"
+    exit 1
+fi
+
 # Sem driver funcional nenhum teste pode rodar: encerra com a causa real, em vez de reprovacoes enganosas
 if ! command -v nvidia-smi &> /dev/null || ! timeout 30 nvidia-smi -L &> /dev/null; then
     if ! command -v nvidia-smi &> /dev/null; then
@@ -268,6 +297,22 @@ if ! command -v nvidia-smi &> /dev/null || ! timeout 30 nvidia-smi -L &> /dev/nu
     fi
     rm -f "$STAMP"
     exit 1
+fi
+
+# ==============================================================================
+# Verificacao previa do acesso ao modelo do vLLM (segundos, em vez de descobrir horas depois)
+# ==============================================================================
+VLLM_MODEL=$(grep -m1 -oE '^VLLM_MODEL="[^"]+"' "$SCRIPT_DIR/05_vllm_benchmark.sh" 2>/dev/null | cut -d'"' -f2)
+VLLM_PRE=""
+if [ -n "$VLLM_MODEL" ]; then
+    HF_CODE=$(curl -s -o /dev/null -w '%{http_code}' -I -L --max-time 30 -H "Authorization: Bearer $HF_TOKEN_ARG" \
+        "https://huggingface.co/$VLLM_MODEL/resolve/main/config.json" 2>/dev/null)
+    case "$HF_CODE" in
+        200) log "Token do Hugging Face: acesso ao modelo $VLLM_MODEL confirmado." ;;
+        401|403) VLLM_PRE="o token do Hugging Face nao tem acesso ao modelo $VLLM_MODEL (HTTP $HF_CODE). Solicite acesso ao modelo na conta do token ou use outro token."
+                 log "ATENCAO: $VLLM_PRE O benchmark vLLM nao sera executado." ;;
+        *) AVISOS+=("vLLM: nao foi possivel verificar o acesso ao modelo $VLLM_MODEL (HTTP ${HF_CODE:-sem resposta}); o benchmark sera tentado assim mesmo.") ;;
+    esac
 fi
 
 # ==============================================================================
@@ -295,8 +340,11 @@ eval_dcgm 3 "$RC" "$DCGM_LOG_T" "DCGM triagem"
 # Etapa 4: NCCL
 # ==============================================================================
 NCCL_SUM=""
+PKG_CAUSE=""; grep -q "AVISO DE SOFTWARE: sistema de pacotes quebrado" "$INV_LOG" 2>/dev/null && PKG_CAUSE=" (sistema de pacotes quebrado: ver inventario)"
 if [ "$GPU_FAILED" = true ]; then
     skip_stage 4 "Teste NCCL (AllReduce, com e sem P2P)"
+elif [ ! -x /usr/local/cuda/bin/nvcc ] || ! dpkg -s libnccl-dev &>/dev/null; then
+    skip_config_stage 4 "Teste NCCL (AllReduce, com e sem P2P)" "CUDA Toolkit ou NCCL nao instalados${PKG_CAUSE}."
 else
     NCCL_ERR=""
     run_stage 4 "Teste NCCL (AllReduce, com e sem P2P)" ./03_nccl_test.sh
@@ -321,6 +369,10 @@ fi
 VLLM_SUM=""
 if [ "$GPU_FAILED" = true ]; then
     skip_stage 5 "Benchmark de inferencia vLLM"
+elif ! command -v docker &>/dev/null || ! docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'; then
+    skip_config_stage 5 "Benchmark de inferencia vLLM" "Docker ou runtime NVIDIA do Docker indisponivel${PKG_CAUSE}."
+elif [ -n "$VLLM_PRE" ]; then
+    skip_config_stage 5 "Benchmark de inferencia vLLM" "$VLLM_PRE"
 else
     run_stage 5 "Benchmark de inferencia vLLM" ./05_vllm_benchmark.sh
     RC=$?
@@ -545,10 +597,48 @@ if [ "$TELEMETRY_ON" = true ]; then
 fi
 
 # ==============================================================================
+# Eventos do BMC (SEL): o que surgiu durante o teste x historico anterior
+# Os registros novos sao identificados pelo id (independe do relogio do BMC, que pode estar errado).
+# ==============================================================================
+SEL_START="$BASE_DIR/inventario/ipmi_sel.txt"
+SEL_END="$REPORT_DIR/ipmi_sel_fim_${HOST}_${TS}.txt"
+SEL_CRIT_RE="Critical Interrupt|Bus (Fatal|Uncorrectable|Correctable) Error|Uncorrectable|Machine Check|IERR|Thermal Trip|Predictive [Ff]ailure|Failure detected|AC lost|Redundancy Lost|Transition to Critical|Non-recoverable|PCI (PERR|SERR)|Correctable ECC|Watchdog"
+SEL_DURING=""; SEL_HIST=""; SEL_NOTE=""
+# "id|data|tipo: evento" de cada registro critico do SEL
+sel_crit() {
+    awk -F'|' -v re="$SEL_CRIT_RE" '{
+        id = $1; gsub(/ /, "", id); d = $2; gsub(/^ +| +$/, "", d)
+        t = $4; gsub(/#0x[0-9a-fA-F]+/, "", t); gsub(/^ +| +$/, "", t); e = $5; gsub(/^ +| +$/, "", e)
+        x = t ": " e
+        if (id != "" && x ~ re && x !~ /graceful/) print id "|" d "|" x }' "$1" 2>/dev/null
+}
+# Agrupa "data|descricao" em "Nx descricao (de A a B)"
+sel_group() {
+    awk -F'|' '{ k = $2; c[k]++; if (!(k in f)) f[k] = $1; l[k] = $1 }
+        END { for (k in c) printf "%dx %s (%s%s)\n", c[k], k, f[k], (l[k] != f[k] ? " a " l[k] : "") }' | sort -rn
+}
+if command -v ipmitool &>/dev/null; then
+    timeout 120 ipmitool sel elist > "$SEL_END" 2>/dev/null
+    if [ -s "$SEL_END" ] && [ -s "$SEL_START" ]; then
+        START_IDS=$(awk -F'|' '{id = $1; gsub(/ /, "", id); if (id != "") print id}' "$SEL_START")
+        SEL_DURING=$(sel_crit "$SEL_END" | while IFS='|' read -r id d desc; do grep -qxF "$id" <<< "$START_IDS" || echo "$d|$desc"; done | sel_group)
+        SEL_HIST=$(sel_crit "$SEL_START" | cut -d'|' -f2- | sel_group)
+        while IFS= read -r e; do [ -n "$e" ] && AVISOS+=("BMC: evento critico registrado DURANTE o teste: $e"); done <<< "$SEL_DURING"
+    else
+        SEL_NOTE="SEL do BMC indisponivel no inicio ou no fim do teste."
+    fi
+else
+    SEL_NOTE="ipmitool indisponivel: eventos do BMC nao verificados."
+fi
+
+# ==============================================================================
 # Relatorio final
 # ==============================================================================
 END_EPOCH=$(date +%s)
-if [ "${#MOTIVOS[@]}" -eq 0 ]; then VERDICT="APROVADO"; else VERDICT="REPROVADO"; fi
+# REPROVADO: falha de hardware/criterio. INCONCLUSIVO: nada reprovou, mas etapas nao rodaram por configuracao.
+if [ "${#MOTIVOS[@]}" -gt 0 ]; then VERDICT="REPROVADO"
+elif [ "${#PENDENCIAS[@]}" -gt 0 ]; then VERDICT="INCONCLUSIVO"
+else VERDICT="APROVADO"; fi
 if [ "$GPU_FAILED" = true ]; then
     TIMELINE+="$FAIL_EPOCH|FALHA PRIMARIA detectada ao fim da etapa $FAIL_STAGE (${ST_DESC[$FAIL_STAGE]}): $FAIL_DESC"$'\n'
 fi
@@ -580,6 +670,10 @@ NCCLT_COMMIT=$(grep -m1 "nccl-tests: commit" "${NCCL_SUM:-/dev/null}" 2>/dev/nul
     if [ "${#MOTIVOS[@]}" -gt 0 ]; then
         echo "Motivos da reprovacao:"
         for m in "${MOTIVOS[@]}"; do echo "  - $m"; done
+    fi
+    if [ "${#PENDENCIAS[@]}" -gt 0 ]; then
+        echo "Nao executado por configuracao do ambiente (o hardware nao foi avaliado nestes itens; corrija e repita):"
+        for c in "${PENDENCIAS[@]}"; do echo "  - $c"; done
     fi
     if [ "${#CONSEQ[@]}" -gt 0 ]; then
         echo "Falhas em consequencia da GPU em falha (nao indicam problemas independentes):"
@@ -668,6 +762,22 @@ NCCLT_COMMIT=$(grep -m1 "nccl-tests: commit" "${NCCL_SUM:-/dev/null}" 2>/dev/nul
     fi
     echo ""
     echo "------------------------------------------------------------------"
+    echo "EVENTOS DO BMC (SEL)"
+    echo "------------------------------------------------------------------"
+    if [ -n "$SEL_NOTE" ]; then
+        echo "  $SEL_NOTE"
+    else
+        if [ -n "$SEL_DURING" ]; then
+            echo "  Durante o teste: $(echo "$SEL_DURING" | wc -l) tipo(s) de evento critico:"
+            echo "$SEL_DURING" | sed 's/^/    /'
+        else
+            echo "  Durante o teste: nenhum evento critico"
+        fi
+        echo "  Historico anterior ao teste (datas do relogio do BMC):"
+        if [ -n "$SEL_HIST" ]; then echo "$SEL_HIST" | head -n 15 | sed 's/^/    /'; else echo "    nenhum evento critico"; fi
+    fi
+    echo ""
+    echo "------------------------------------------------------------------"
     echo "VERSOES"
     echo "------------------------------------------------------------------"
     echo "  Driver NVIDIA: ${DRIVER_VER:-?} (CUDA suportado pelo driver: ${DRIVER_CUDA:-?}) | CUDA Toolkit: ${CUDA_VER:-?} | NCCL: ${NCCL_VER:-?}"
@@ -696,5 +806,9 @@ chown -R "$REAL_USER": "$REPORT_DIR" 2>/dev/null
 log "Relatorio: $REPORT"
 log "Pacote com todos os arquivos: $TARBALL"
 log "--- Homologacao concluida: $VERDICT ---"
-[ "$VERDICT" = "APROVADO" ] && exit 0 || exit 3
+case "$VERDICT" in
+    APROVADO) exit 0 ;;
+    INCONCLUSIVO) exit 1 ;;
+    *) exit 3 ;;
+esac
 }

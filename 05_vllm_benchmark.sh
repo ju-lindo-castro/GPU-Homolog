@@ -1,5 +1,5 @@
 #!/bin/bash
-# Modulo 5: Benchmark de Inferencia (vLLM Llama-3.3-70B) - v10 (pipefail + deteccao de falha + imagem vLLM fixa + dataset explicito + permissoes do cache HF)
+# Modulo 5: Benchmark de Inferencia (vLLM Llama-3.3-70B) - v11 (pipefail + deteccao de falha + imagem vLLM fixa + dataset explicito + permissoes do cache HF + modelo configuravel)
 
 set -eo pipefail
 
@@ -13,6 +13,8 @@ SUMMARY_LOG="$BASE_DIR/benchmark/vllm_resumo_${TIMESTAMP}.txt"
 
 # Versao fixa da imagem do vLLM (garante resultados comparaveis entre homologacoes)
 VLLM_IMAGE="vllm/vllm-openai:v0.34.0"
+# Modelo do benchmark (restrito no Hugging Face: a conta do token precisa ter acesso aprovado)
+VLLM_MODEL="meta-llama/Llama-3.3-70B-Instruct"
 
 echo "Iniciando Teste de Inferencia vLLM (Llama 3.3 70B)..." | tee -a "$FULL_LOG"
 echo "Data: $(date)" | tee -a "$FULL_LOG"
@@ -40,7 +42,7 @@ trap 'sudo chown -R "$(id -u):$(id -g)" "$HF_CACHE" 2>/dev/null || true' EXIT
 echo "Executando o container oficial do vLLM com acesso a todas as GPUs..." | tee -a "$FULL_LOG"
 
 # Fix: O espaco falso (NBSP) e a quebra de linha mal formatada foram corrigidos no comando docker run.
-if sudo docker run --rm --gpus all --ipc=host     --entrypoint /bin/bash     -v "$HF_CACHE":/root/.cache/huggingface     -v "$BASE_DIR/benchmark":/workspace     -w /workspace     -e HF_TOKEN="$HF_TOKEN"     -e NCCL_P2P_DISABLE=1     "$VLLM_IMAGE"     -c "vllm bench throughput --backend vllm --model meta-llama/Llama-3.3-70B-Instruct --tensor-parallel-size 8 --dataset-name sharegpt --dataset-path ShareGPT_V3_unfiltered_cleaned_split.json --num-prompts 1000" 2>&1 | tee -a "$FULL_LOG"; then
+if sudo docker run --rm --gpus all --ipc=host     --entrypoint /bin/bash     -v "$HF_CACHE":/root/.cache/huggingface     -v "$BASE_DIR/benchmark":/workspace     -w /workspace     -e HF_TOKEN="$HF_TOKEN"     -e NCCL_P2P_DISABLE=1     "$VLLM_IMAGE"     -c "vllm bench throughput --backend vllm --model $VLLM_MODEL --tensor-parallel-size 8 --dataset-name sharegpt --dataset-path ShareGPT_V3_unfiltered_cleaned_split.json --num-prompts 1000" 2>&1 | tee -a "$FULL_LOG"; then
     echo "Benchmark de Inferencia concluido!" | tee -a "$FULL_LOG"
 else
     echo "ERRO: O benchmark vLLM falhou. Verifique o log completo: $FULL_LOG" | tee -a "$FULL_LOG"
@@ -49,7 +51,7 @@ fi
 
 echo "==================================================" > "$SUMMARY_LOG"
 echo "RESUMO DO BENCHMARK DE INFERENCIA (vLLM)" >> "$SUMMARY_LOG"
-echo "Modelo: Llama 3.3 70B-Instruct (TP=8)" >> "$SUMMARY_LOG"
+echo "Modelo: $VLLM_MODEL (TP=8)" >> "$SUMMARY_LOG"
 echo "Imagem: $VLLM_IMAGE | Digest: $(sudo docker image inspect --format '{{index .RepoDigests 0}}' "$VLLM_IMAGE" 2>/dev/null || echo desconhecido)" >> "$SUMMARY_LOG"
 echo "Data da execucao: $(date)" >> "$SUMMARY_LOG"
 echo "Host: $(hostname)" >> "$SUMMARY_LOG"

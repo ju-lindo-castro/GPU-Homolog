@@ -1,5 +1,5 @@
 #!/bin/bash
-# Modulo 2: Diagnostico DCGM Completo (v12 - Gatekeeper de Saude PCIe/Hardware + Execucao como root + Avaliacao do JSON FAIL/WARN + deteccao de driver ausente + identificacao da GPU em falha + intervalo de niveis + modo --health)
+# Modulo 2: Diagnostico DCGM Completo (v13 - plataforma nao pronta (Fabric Manager) separada de hardware + Gatekeeper de Saude PCIe/Hardware + Execucao como root + Avaliacao do JSON FAIL/WARN + deteccao de driver ausente + identificacao da GPU em falha + intervalo de niveis + modo --health)
 # Uso: ./02_dcgm_diag_completo.sh [NIVEL_MAXIMO]          niveis 1 ate NIVEL_MAXIMO (padrao: 4). Ex.: ./02_dcgm_diag_completo.sh 2
 #      ./02_dcgm_diag_completo.sh <NIVEL_MIN> <NIVEL_MAX>  intervalo de niveis. Ex.: ./02_dcgm_diag_completo.sh 3 4
 #      ./02_dcgm_diag_completo.sh --health                 apenas verifica a saude das GPUs (sem rodar o DCGM)
@@ -179,16 +179,20 @@ check_gpu_health() {
 # ==============================================================================
 # Avaliacao do resultado JSON do DCGM (compativel com DCGM 3.x e 4.x)
 # Extrai uma linha por falha/aviso: teste <TAB> GPU <TAB> FAIL|WARN <TAB> mensagem
+# O DCGM 4.x pode colocar o motivo so no resumo do teste (test_summary.warnings): usado quando
+# o resultado da GPU nao traz mensagem propria.
 # ==============================================================================
 read -r -d '' JQ_PROG <<'JQEOF'
+def msgs: (if type == "array" then . else [.] end)
+    | map(select(. != null) | if type == "object" then (.warning // .message // tojson) else tostring end);
 [ .. | objects | select(has("name") and has("results")) ] | .[] | .name as $t
+| ((.test_summary.warnings // []) | msgs) as $tw
 | .results[]?
 | select((.status // "") | test("^(fail|warn)"; "i"))
 | (.gpu_id // .gpu_ids // .entity_id // "-" | tostring) as $g
 | (.status | ascii_upcase | .[0:4]) as $s
-| ((.warnings // .info // []) | if type == "array" then . else [.] end
-   | map(if type == "object" then (.warning // .message // tojson) else tostring end)
-   | if length == 0 then ["(sem mensagem)"] else . end)[]
+| ((.warnings // .info // []) | msgs) as $own
+| (if ($own | length) > 0 then $own elif ($tw | length) > 0 then $tw else ["(sem mensagem)"] end)[]
 | "\($t)\t\($g)\t\($s)\t\(gsub("[\\r\\n\\t]+"; " "))"
 JQEOF
 
@@ -226,7 +230,7 @@ classify_warning() {
 # Retorna 1 se o arquivo estiver vazio ou nao for um JSON valido.
 evaluate_dcgm_json() {
     local json="$1" lines test gpu status msg cls tipo motivo
-    DIAG_FAILS=0; DIAG_MALIGN=0; DIAG_BENIGN=0
+    DIAG_FAILS=0; DIAG_MALIGN=0; DIAG_BENIGN=0; DIAG_PLATFORM=0; DIAG_PLATFORM_MSG=""
     [ -s "$json" ] || return 1
     lines=$(jq -r "$JQ_PROG" "$json" 2>/dev/null) || return 1
     while IFS=$'\t' read -r test gpu status msg; do
@@ -234,6 +238,10 @@ evaluate_dcgm_json() {
         if [ "$status" = "FAIL" ]; then
             DIAG_FAILS=$((DIAG_FAILS + 1))
             log "  [FAIL] Teste: $test | GPU: $gpu | Motivo: $msg"
+            # Plataforma nao pronta (Fabric Manager ou CUDA sem inicializar): o hardware nao foi avaliado
+            if echo "$msg" | grep -qiE "fabric ?manager|system not yet initialized|training in progress"; then
+                DIAG_PLATFORM=$((DIAG_PLATFORM + 1)); [ -z "$DIAG_PLATFORM_MSG" ] && DIAG_PLATFORM_MSG="$msg"
+            fi
         else
             cls=$(classify_warning "$msg"); tipo="${cls%%|*}"; motivo="${cls#*|}"
             if [ "$tipo" = "BENIGNO" ]; then
@@ -340,6 +348,12 @@ for LEVEL in $(seq "$MIN_LEVEL" "$MAX_LEVEL"); do
     if evaluate_dcgm_json "$OUTPUT_FILE"; then
         JSON_OK=true
         TOTAL_BENIGN=$((TOTAL_BENIGN + DIAG_BENIGN))
+        if [ "$DIAG_PLATFORM" -gt 0 ]; then
+            log "=================================================="
+            log "PLATAFORMA NAO PRONTA NO NIVEL $LEVEL: $DIAG_PLATFORM falha(s) causadas pelo ambiente, nao pelo hardware. Motivo: $DIAG_PLATFORM_MSG"
+            log "DIAGNOSTICO FINAL: Plataforma nao pronta (Fabric Manager ou CUDA nao inicializado); o hardware nao foi avaliado. Execute o Modulo 1 (instala e ativa o Fabric Manager) e repita o diagnostico."
+            exit 1
+        fi
         if [ "$DIAG_FAILS" -gt 0 ] || [ "$DIAG_MALIGN" -gt 0 ]; then
             log "=================================================="
             log "REPROVADO NO NIVEL $LEVEL: $DIAG_FAILS falha(s) e $DIAG_MALIGN aviso(s) maligno(s). Detalhes acima e em: $OUTPUT_FILE"

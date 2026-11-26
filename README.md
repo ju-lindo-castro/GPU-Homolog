@@ -21,7 +21,9 @@ Ao final, o orquestrador gera um relatório **APROVADO / REPROVADO** com os moti
 4. Token do Hugging Face com permissão *Read*, em uma conta que tenha aceitado a licença do modelo `meta-llama/Llama-3.3-70B-Instruct`.
 5. Acesso à internet: repositórios apt (Ubuntu, NVIDIA CUDA, NVIDIA Container Toolkit), GitHub, Docker Hub e Hugging Face.
 
-Todo o restante (driver NVIDIA, CUDA Toolkit, NCCL, DCGM 4, Docker, NVIDIA Container Toolkit, jq, dmidecode etc.) é instalado automaticamente pelo Módulo 1.
+Todo o restante (driver NVIDIA, Fabric Manager, CUDA Toolkit, NCCL, DCGM 4, Docker, NVIDIA Container Toolkit, jq, dmidecode etc.) é instalado automaticamente pelo Módulo 1.
+
+> **Use somente em servidor dedicado ao teste.** O GPU-Homolog altera o sistema: instala e remove pacotes, desativa as atualizações automáticas do Ubuntu, trava o kernel, instala e reinicia serviços e pode reiniciar o servidor. Ele foi feito para servidores ainda não liberados ou devolvidos para avaliação, reinstalados com Ubuntu limpo antes e depois da homologação. Como proteção, o Módulo 1 não executa se houver processos usando as GPUs ou containers rodando. Para ignorar essa trava, execute como root com `HOMOLOG_IGNORAR_TRAVA=1`.
 
 ---
 
@@ -114,11 +116,17 @@ Arquivos gerados em `~/homologacao/relatorios/`:
 
 | Arquivo | Conteúdo |
 |---|---|
-| `relatorio_<host>_<data>.txt` | Resultado (APROVADO, REPROVADO, PENDENTE - REBOOT NECESSÁRIO ou NÃO EXECUTADO) e motivos, status e duração de cada etapa, linha do tempo dos eventos, resumo de cada teste, tabela térmica por GPU, versões de software, fabricante, modelo, serial e BIOS do servidor |
+| `relatorio_<host>_<data>.txt` | Resultado (APROVADO, REPROVADO, INCONCLUSIVO, PENDENTE - REBOOT NECESSÁRIO ou NÃO EXECUTADO) e motivos, status e duração de cada etapa, linha do tempo dos eventos, eventos do BMC, resumo de cada teste, tabela térmica por GPU, versões de software, fabricante, modelo, serial e BIOS do servidor |
 | `homologacao_<host>_<data>.tar.gz` | Todos os arquivos gerados na execução (sem o dataset e sem o código do nccl-tests) |
 | `00_orquestrador_<host>_<data>.log` | Saída completa de todos os módulos |
 
 Se o Módulo 1 instalar o driver, o orquestrador grava um relatório **PENDENTE - REBOOT NECESSÁRIO**, avisa e reinicia o servidor. Se o driver estiver ausente e a instalação falhar, ou se o driver não responder, o resultado é **NÃO EXECUTADO** com a causa real: os demais testes não rodam, para não gerar reprovações enganosas.
+
+O orquestrador também encerra como **NÃO EXECUTADO** quando o servidor está em uso (trava de segurança) ou quando o Fabric Manager não concluiu o treinamento do NVLink.
+
+Logo no início, ele confirma se o token do Hugging Face tem acesso ao modelo do vLLM. Etapas que não podem rodar por configuração do ambiente (token sem acesso, CUDA/NCCL ou Docker não instalados, plataforma não pronta no DCGM) ficam como **NÃO EXECUTADO** com a causa e não reprovam o hardware. Se nada reprovar, mas alguma etapa tiver ficado sem rodar por esse motivo, o resultado é **INCONCLUSIVO** (código `1`): corrija a configuração e repita.
+
+O relatório também traz os **eventos críticos do BMC (SEL)**, separando os registrados durante o teste (que entram como avisos) do histórico anterior. Os eventos novos são identificados pelo número do registro, porque o relógio do BMC pode estar errado.
 
 Se uma GPU travar ou cair do barramento em qualquer etapa, essa etapa é a **falha primária**: o relatório identifica a GPU (índice, PCI e serial) e as etapas seguintes ficam como **NÃO EXECUTADO**, porque rodariam sobre hardware quebrado. A telemetria é sempre encerrada e analisada, para preservar as evidências. Faltas de resposta do `nvidia-smi` depois da falha aparecem como consequência; as anteriores, como sinal precoce.
 
@@ -150,12 +158,14 @@ O servidor é **REPROVADO** se ocorrer qualquer um dos itens abaixo.
 
 | Origem | Critério |
 |---|---|
-| Inventário | Menos de 8 GPUs no PCIe ou no driver; GPU com link PCIe abaixo da geração máxima suportada pela própria GPU (ex.: L40S = Gen4, RTX PRO 6000 Blackwell = Gen5) ou com largura menor que x16; GPU pendente de reboot (*Recovery Action*); container Docker sem acesso às 8 GPUs |
+| Inventário | Menos de 8 GPUs no PCIe ou no driver; GPU com link PCIe abaixo da geração máxima suportada pela própria GPU (ex.: L40S = Gen4, RTX PRO 6000 Blackwell = Gen5) ou com largura menor que x16; GPU pendente de reboot (*Recovery Action*) |
 | DCGM | Qualquer teste com `FAIL`; qualquer `WARN` maligno (ECC, Xid, throttling, PCIe, energia, desempenho abaixo do limite ou aviso não catalogado); GPU caiu do barramento ou travou (pendente de reset) |
 | NCCL | Corrupção de dados (`#wrong` ≠ 0 ou `Out of bounds values` ≠ 0) em qualquer rodada; teste incompleto; banda abaixo de `MIN_BUSBW_GBPS` (se definido); GPU em falha na verificação de saúde ao fim da etapa |
 | vLLM | Falha na execução do benchmark; GPU em falha na verificação de saúde ao fim da etapa |
 | Telemetria | GPU acima de **90 °C**; throttling térmico, HW Slowdown ou Power Brake; GPU que não atinge, sob carga, a geração PCIe máxima que ela suporta; erros ECC não corrigidos; `nvidia-smi` sem resposta |
 | Kernel | Xid crítico (48, 61, 62, 63, 64, 74, 79, 92, 94, 95, 119, 120, 154) ou *GPU has fallen off the bus* |
+
+Problemas de configuração do ambiente (container Docker sem acesso às GPUs, CUDA abaixo do mínimo, pacotes não instalados, token sem acesso ao modelo, Fabric Manager sem concluir) **não reprovam**: a etapa afetada fica como NÃO EXECUTADO e o resultado, INCONCLUSIVO.
 
 Ficam **apenas registrados**, sem reprovar: o throughput do vLLM, a banda do NCCL (enquanto `MIN_BUSBW_GBPS=0`), a indisponibilidade de P2P, os avisos benignos do DCGM (Persistence Mode, recurso não suportado, modo MIG) e os Xids não críticos.
 
@@ -167,13 +177,15 @@ Ficam **apenas registrados**, sem reprovar: o throughput do vLLM, a banda do NCC
 
 ### Módulo 1 — Inventário e preparação do ambiente
 
+- **Prepara o sistema de pacotes:** desativa as atualizações automáticas do Ubuntu durante o teste (elas travam o apt e instalam kernel novo), espera instalações em andamento e conclui instalações interrompidas. Se a instalação quebrada for de um kernel diferente do que está em uso (caso típico: o DKMS não consegue compilar o módulo NVIDIA para o kernel novo), remove esses pacotes e trava o kernel. Em qualquer outro caso, emite um único `AVISO DE SOFTWARE` com a causa. O registro completo fica em `inventario/pacotes_reparo.log`.
 - Se o **driver NVIDIA** estiver ausente, instala o `nvidia-open` (com os headers do kernel) e pede reboot, com código de saída `4`. Rodando sozinho, o próprio módulo avisa e reinicia o servidor em 60 segundos. Avisa se o Secure Boot estiver habilitado, porque ele pode impedir o carregamento do módulo do driver.
+- **Fabric Manager** (só em servidores com NVSwitch: H100, H200 e B300 SXM): instala o Fabric Manager na mesma versão do driver (mais NVSDM e NVLSM no Blackwell), ativa o serviço e espera o treinamento do NVLink concluir (até `FM_WAIT_MAX`, 10 minutos). Se o repositório não tiver Fabric Manager para a versão do driver, realinha driver e Fabric Manager pelo repositório NVIDIA e reinicia o servidor (código `4`). Se mesmo assim o fabric não concluir, registra `NAO EXECUTADO` com a causa: sem o fabric, o CUDA não inicializa e os testes dariam falsas reprovações.
 - Configura o repositório oficial NVIDIA CUDA e instala o **CUDA Toolkit** e a **NCCL** na versão alinhada ao CUDA suportado pelo driver (mínimo 12.8). Remove o `nvidia-cuda-toolkit` do Ubuntu, que não suporta Blackwell.
 - Instala o **DCGM 4** (`datacenter-gpu-manager-4-cuda<major>`), migrando automaticamente do DCGM 3.x.
 - Instala o **Docker** e o **NVIDIA Container Toolkit** (versão fixa `1.20.2-1`) e confirma que um container enxerga as 8 GPUs.
 - Coleta o inventário: `nvidia-smi -q`, topologia, PCIe, CPU, memória, discos, `lspci`, IPMI SEL e versões de software.
 - Audita a quantidade de GPUs (`EXPECTED_GPUS=8`), o link PCIe de cada GPU (geração máxima suportada pela própria GPU, largura x16) e o estado de *Recovery Action*.
-- Registra o modo do IOMMU e a linha de comando do kernel. Avisa quando o IOMMU está em modo de tradução, porque isso pode fazer o P2P entre GPUs falhar ou corromper dados (veja [Solução de problemas](#solução-de-problemas)).
+- Registra o modo do IOMMU e a linha de comando do kernel. Avisa quando o IOMMU está em modo de tradução, porque isso pode fazer o P2P entre GPUs falhar ou corromper dados (veja [Solução de problemas](#solução-de-problemas)). Em servidores com NVSwitch, o aviso cita o impacto no GPUDirect RDMA, porque nesses servidores o P2P entre GPUs passa pelo NVLink.
 
 ### Módulo 2 — Diagnóstico DCGM
 
@@ -187,6 +199,7 @@ Ficam **apenas registrados**, sem reprovar: o throughput do vLLM, a banda do NCC
 - Antes e depois de cada nível, verifica a saúde das GPUs: contagem no PCIe e no driver, *Recovery Action* e Xid crítico no `dmesg`. Se uma GPU travar, informa qual (índice, PCI e serial) e encerra com código 2. Cada consulta ao `nvidia-smi` nessa verificação tem limite de 60 segundos (`HEALTH_SMI_TIMEOUT`): sem resposta, conta como GPU ou driver travado.
 - `--health` faz só essa verificação, sem rodar o DCGM, e sai com `0` (saudável) ou `2` (GPU em falha). O orquestrador a usa entre as etapas; o log fica em `dcgm/health_<data>.log`.
 - Lê o JSON de cada nível e lista cada falha ou aviso com o teste, a GPU e a motivação. Avisos benignos são registrados e o teste continua. Para tratar um novo aviso como benigno, adicione o padrão na função `classify_warning`.
+- Lê também o motivo registrado no resumo de cada teste (`test_summary`), onde o DCGM 4 costuma colocá-lo. Falhas causadas pelo ambiente (Fabric Manager sem concluir, CUDA sem inicializar) encerram com código `1` e a mensagem `PLATAFORMA NAO PRONTA`, sem reprovar o hardware.
 - Eleva-se automaticamente para root.
 
 > Em GPUs que não são de datacenter (como a RTX PRO 6000), o DCGM tem funcionalidade limitada e alguns testes podem ser reportados como não suportados. Na primeira execução em um novo modelo, revise o JSON para confirmar quais testes rodaram.
@@ -214,7 +227,7 @@ Ficam **apenas registrados**, sem reprovar: o throughput do vLLM, a banda do NCC
 
 - Executa `vllm bench throughput` com o Llama 3.3 70B Instruct, TP=8 e 1.000 prompts do dataset ShareGPT.
 - Usa a imagem fixa `vllm/vllm-openai:v0.34.0`, para que os resultados sejam comparáveis entre homologações. A imagem e o digest ficam registrados no resumo.
-- O token é lido da variável `HF_TOKEN`; o orquestrador a preenche a partir do `-t`.
+- O token é lido da variável `HF_TOKEN`; o orquestrador a preenche a partir do `-t`. O modelo fica na constante `VLLM_MODEL`; o orquestrador verifica no início se o token tem acesso a ele.
 
 ---
 
@@ -238,6 +251,23 @@ Quando muitos pares de GPUs falham no teste `pcie` do DCGM, a causa costuma ser 
    ```
 
 Essas são mudanças de configuração no servidor do cliente: combine com ele antes de aplicar.
+
+### Fabric Manager não concluído (`system not yet initialized`, erro 802)
+
+Em servidores com NVSwitch (H100, H200 e B300 SXM), o CUDA só inicializa depois que o Fabric Manager conclui o treinamento do NVLink. O Módulo 1 instala e ativa o Fabric Manager automaticamente. Se o relatório indicar NÃO EXECUTADO por esse motivo, confira:
+
+```bash
+nvidia-smi -q | grep -A 2 Fabric
+systemctl status nvidia-fabricmanager
+journalctl -u nvidia-fabricmanager -b
+nv-fabricmanager --version
+```
+
+A versão do Fabric Manager precisa ser igual à do driver; a partir do branch 620, ele é lançado separado do driver. No Blackwell, o NVLSM também precisa estar instalado. O estado coletado fica em `inventario/fabricmanager.txt`.
+
+### Sistema de pacotes quebrado (`AVISO DE SOFTWARE`)
+
+Com uma instalação pendente ou com erro, todo `apt install` falha, e CUDA, NCCL e Docker não são instalados. O Módulo 1 tenta concluir a instalação e, se o problema for um kernel diferente do que está em uso, remove esse kernel e trava as atualizações dele. Nos demais casos, a causa aparece no aviso e o registro completo fica em `inventario/pacotes_reparo.log`. Para investigar à mão: `sudo dpkg --configure -a` e `dkms status`.
 
 ### GPU travada durante o estresse (Xid 119/154, *Recovery Action*)
 
@@ -276,7 +306,7 @@ Atualizações de BIOS e trocas de slot no servidor do cliente devem ser combina
 | Código | Significado |
 |---|---|
 | `0` | Aprovado |
-| `1` | Erro de software ou de execução (teste incompleto) |
+| `1` | Erro de software ou de execução (teste incompleto). No orquestrador: NÃO EXECUTADO ou INCONCLUSIVO. |
 | `2` | GPU caiu do barramento ou travou e ficou pendente de reset (reboot físico obrigatório). Usado pelo Módulo 2 (inclusive no modo `--health`), que identifica a GPU (índice, PCI e serial). |
 | `3` | Hardware reprovado |
 | `4` | Driver NVIDIA instalado: reboot necessário. Usado pelos Módulos 0 e 1. |
@@ -305,6 +335,9 @@ Constantes no início de cada script:
 | `NCCL_TESTS_REF` | 03 | vazio | Commit ou tag do nccl-tests (vazio = ramo principal) |
 | `INTERVAL` | 04 | `5` | Intervalo da telemetria, em segundos |
 | `VLLM_IMAGE` | 05 | `vllm/vllm-openai:v0.34.0` | Imagem do vLLM |
+| `VLLM_MODEL` | 05 | `meta-llama/Llama-3.3-70B-Instruct` | Modelo do benchmark (restrito: a conta do token precisa ter acesso) |
+| `FM_WAIT_MAX` | 01 | `600` | Tempo máximo, em segundos, esperando o Fabric Manager concluir o treinamento do NVLink |
+| `APT_LOCK_WAIT` | 01 | `600` | Tempo máximo, em segundos, esperando uma instalação em andamento liberar o apt |
 
 ---
 
