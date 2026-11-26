@@ -98,37 +98,49 @@ Use o comando do [Início rápido](#início-rápido-copiar-e-colar). Com os scri
 cd ~/GPU-Homolog && ./00_homologacao.sh -t <HF_TOKEN>
 ```
 
-O orquestrador roda como root do começo ao fim e executa **todos os módulos, mesmo que algum falhe**. Em um host com problema relatado pelo cliente, todas as evidências são importantes. A sequência é:
+O orquestrador roda como root do começo ao fim. Uma falha de teste não interrompe a bateria: em um host com problema relatado pelo cliente, todas as evidências são importantes. A sequência é:
 
 1. Inventário e auditoria de hardware (Módulo 1)
 2. Início da telemetria (Módulo 4)
-3. Diagnóstico DCGM, níveis 1 a 4 (Módulo 2)
+3. DCGM triagem, níveis 1 e 2 (Módulo 2): leva poucos minutos e aponta uma GPU já defeituosa antes dos testes de carga
 4. Teste NCCL (Módulo 3)
 5. Benchmark vLLM (Módulo 5)
-6. Fim da telemetria e análise do burn-in
+6. DCGM estresse, níveis 3 e 4 (Módulo 2): os níveis longos, que mais costumam derrubar GPUs instáveis
+7. Fim da telemetria e análise do burn-in
+
+NCCL e vLLM rodam antes do estresse longo para que a banda e o throughput sejam medidos com as GPUs saudáveis. Depois do NCCL e do vLLM, o orquestrador verifica a saúde das GPUs com `02_dcgm_diag_completo.sh --health`.
 
 Arquivos gerados em `~/homologacao/relatorios/`:
 
 | Arquivo | Conteúdo |
 |---|---|
-| `relatorio_<host>_<data>.txt` | Resultado (APROVADO, REPROVADO, PENDENTE - REBOOT NECESSÁRIO ou NÃO EXECUTADO) e motivos, status e duração de cada etapa, resumo de cada teste, tabela térmica por GPU, versões de software, fabricante, modelo, serial e BIOS do servidor |
+| `relatorio_<host>_<data>.txt` | Resultado (APROVADO, REPROVADO, PENDENTE - REBOOT NECESSÁRIO ou NÃO EXECUTADO) e motivos, status e duração de cada etapa, linha do tempo dos eventos, resumo de cada teste, tabela térmica por GPU, versões de software, fabricante, modelo, serial e BIOS do servidor |
 | `homologacao_<host>_<data>.tar.gz` | Todos os arquivos gerados na execução (sem o dataset e sem o código do nccl-tests) |
 | `00_orquestrador_<host>_<data>.log` | Saída completa de todos os módulos |
 
 Se o Módulo 1 instalar o driver, o orquestrador grava um relatório **PENDENTE - REBOOT NECESSÁRIO**, avisa e reinicia o servidor. Se o driver estiver ausente e a instalação falhar, ou se o driver não responder, o resultado é **NÃO EXECUTADO** com a causa real: os demais testes não rodam, para não gerar reprovações enganosas.
 
-Se uma GPU travar no DCGM, o relatório lista a GPU em falha nos motivos e coloca as falhas seguintes (NCCL, vLLM, travamentos do `nvidia-smi`) numa seção à parte, como consequência dessa GPU, com status **AFETADO**. Cada Xid crítico do kernel é atribuído à GPU correspondente.
+Se uma GPU travar ou cair do barramento em qualquer etapa, essa etapa é a **falha primária**: o relatório identifica a GPU (índice, PCI e serial) e as etapas seguintes ficam como **NÃO EXECUTADO**, porque rodariam sobre hardware quebrado. A telemetria é sempre encerrada e analisada, para preservar as evidências. Faltas de resposta do `nvidia-smi` depois da falha aparecem como consequência; as anteriores, como sinal precoce.
+
+A **linha do tempo** do relatório mostra o início e o fim de cada etapa e associa cada Xid e cada falta de resposta do `nvidia-smi` à etapa (e ao nível do DCGM) em que ocorreu, com a GPU correspondente. Por exemplo:
+
+```
+2026-11-25 22:19:22  Xid 119 na GPU 1 (PCI 0000:21:00, serial 1324023086915) (3x) - etapa 6, DCGM estresse (niveis 3 a 4), nivel 3
+```
+
+Como o log do kernel é lido desde o boot, Xids anteriores aos testes aparecem como "antes do inicio da homologacao".
 
 ### Opção 2 — Manual (módulo a módulo)
 
 1. `./01_inventario.sh`: prossiga somente se o log terminar com `STATUS DO HARDWARE: SAUDAVEL` e sem nenhum `ALERTA CRITICO`.
 2. `./04_telemetria.sh start`
-3. `./02_dcgm_diag_completo.sh 4`: prossiga somente com código de saída `0`.
+3. `./02_dcgm_diag_completo.sh 2`: triagem (níveis 1 e 2). Prossiga somente com código de saída `0`.
 4. `./03_nccl_test.sh`: prossiga somente com código de saída `0`.
 5. `export HF_TOKEN=<seu_token>` e, em seguida, `./05_vllm_benchmark.sh`
-6. `./04_telemetria.sh stop`
+6. `./02_dcgm_diag_completo.sh 3 4`: estresse (níveis 3 e 4; pode levar horas).
+7. `./04_telemetria.sh stop`
 
-Para conferir o código de saída de um módulo, execute `echo $?` logo após o término.
+Para conferir o código de saída de um módulo, execute `echo $?` logo após o término. Entre as etapas, `./02_dcgm_diag_completo.sh --health` confirma se as GPUs continuam saudáveis (código `0`) ou se alguma travou (código `2`).
 
 ---
 
@@ -140,14 +152,14 @@ O servidor é **REPROVADO** se ocorrer qualquer um dos itens abaixo.
 |---|---|
 | Inventário | Menos de 8 GPUs no PCIe ou no driver; GPU com link PCIe abaixo da geração máxima suportada pela própria GPU (ex.: L40S = Gen4, RTX PRO 6000 Blackwell = Gen5) ou com largura menor que x16; GPU pendente de reboot (*Recovery Action*); container Docker sem acesso às 8 GPUs |
 | DCGM | Qualquer teste com `FAIL`; qualquer `WARN` maligno (ECC, Xid, throttling, PCIe, energia, desempenho abaixo do limite ou aviso não catalogado); GPU caiu do barramento ou travou (pendente de reset) |
-| NCCL | Corrupção de dados (`#wrong` ≠ 0 ou `Out of bounds values` ≠ 0) em qualquer rodada; teste incompleto; banda abaixo de `MIN_BUSBW_GBPS` (se definido) |
-| vLLM | Falha na execução do benchmark |
+| NCCL | Corrupção de dados (`#wrong` ≠ 0 ou `Out of bounds values` ≠ 0) em qualquer rodada; teste incompleto; banda abaixo de `MIN_BUSBW_GBPS` (se definido); GPU em falha na verificação de saúde ao fim da etapa |
+| vLLM | Falha na execução do benchmark; GPU em falha na verificação de saúde ao fim da etapa |
 | Telemetria | GPU acima de **90 °C**; throttling térmico, HW Slowdown ou Power Brake; GPU que não atinge, sob carga, a geração PCIe máxima que ela suporta; erros ECC não corrigidos; `nvidia-smi` sem resposta |
 | Kernel | Xid crítico (48, 61, 62, 63, 64, 74, 79, 92, 94, 95, 119, 120, 154) ou *GPU has fallen off the bus* |
 
 Ficam **apenas registrados**, sem reprovar: o throughput do vLLM, a banda do NCCL (enquanto `MIN_BUSBW_GBPS=0`), a indisponibilidade de P2P, os avisos benignos do DCGM (Persistence Mode, recurso não suportado, modo MIG) e os Xids não críticos.
 
-> O log do kernel é lido desde o boot, então inclui eventos anteriores aos testes. Isso é útil para investigar reclamações do cliente.
+> O log do kernel é lido desde o boot, então inclui eventos anteriores aos testes. Isso é útil para investigar reclamações do cliente; a linha do tempo do relatório indica quais eventos aconteceram antes do início da homologação.
 
 ---
 
@@ -166,11 +178,14 @@ Ficam **apenas registrados**, sem reprovar: o throughput do vLLM, a banda do NCC
 ### Módulo 2 — Diagnóstico DCGM
 
 ```bash
-./02_dcgm_diag_completo.sh [NIVEL_MAXIMO]   # padrão: 4
+./02_dcgm_diag_completo.sh [NIVEL_MAXIMO]          # níveis 1 até o máximo (padrão: 4)
+./02_dcgm_diag_completo.sh <NIVEL_MIN> <NIVEL_MAX>  # intervalo de níveis, ex.: 3 4
+./02_dcgm_diag_completo.sh --health                 # só verifica a saúde das GPUs
 ```
 
-- Executa os níveis 1 a 4 em sequência. Os níveis 3 e 4 geram estresse intenso e podem levar horas.
-- Antes e depois de cada nível, verifica a saúde das GPUs: contagem no PCIe e no driver, *Recovery Action* e Xid crítico no `dmesg`. Se uma GPU travar, informa qual (índice, PCI e serial) e encerra com código 2.
+- Executa os níveis pedidos em sequência. Os níveis 3 e 4 geram estresse intenso e podem levar horas.
+- Antes e depois de cada nível, verifica a saúde das GPUs: contagem no PCIe e no driver, *Recovery Action* e Xid crítico no `dmesg`. Se uma GPU travar, informa qual (índice, PCI e serial) e encerra com código 2. Cada consulta ao `nvidia-smi` nessa verificação tem limite de 60 segundos (`HEALTH_SMI_TIMEOUT`): sem resposta, conta como GPU ou driver travado.
+- `--health` faz só essa verificação, sem rodar o DCGM, e sai com `0` (saudável) ou `2` (GPU em falha). O orquestrador a usa entre as etapas; o log fica em `dcgm/health_<data>.log`.
 - Lê o JSON de cada nível e lista cada falha ou aviso com o teste, a GPU e a motivação. Avisos benignos são registrados e o teste continua. Para tratar um novo aviso como benigno, adicione o padrão na função `classify_warning`.
 - Eleva-se automaticamente para root.
 
@@ -226,7 +241,7 @@ Essas são mudanças de configuração no servidor do cliente: combine com ele a
 
 ### GPU travada durante o estresse (Xid 119/154, *Recovery Action*)
 
-O relatório identifica a GPU em falha pelo índice, endereço PCI e serial, por exemplo `GPU 1 (PCI 00000000:21:00.0, serial 1324023086915)`. Xid 119 é timeout do GSP (firmware da GPU) e Xid 154 indica que a GPU precisa de reset. Os testes que falham depois disso (NCCL, vLLM, travamentos do `nvidia-smi`) aparecem como **consequência** da GPU em falha: não são problemas independentes.
+O relatório identifica a GPU em falha pelo índice, endereço PCI e serial, por exemplo `GPU 1 (PCI 00000000:21:00.0, serial 1324023086915)`. Xid 119 é timeout do GSP (firmware da GPU) e Xid 154 indica que a GPU precisa de reset. As etapas seguintes ficam como **NÃO EXECUTADO** e os travamentos do `nvidia-smi` depois da falha aparecem como **consequência**: não são problemas independentes. A linha do tempo do relatório mostra em que etapa e em que nível do DCGM cada Xid apareceu.
 
 Para separar defeito da GPU de problema da plataforma (slot, riser, BIOS):
 
@@ -262,7 +277,7 @@ Atualizações de BIOS e trocas de slot no servidor do cliente devem ser combina
 |---|---|
 | `0` | Aprovado |
 | `1` | Erro de software ou de execução (teste incompleto) |
-| `2` | GPU caiu do barramento ou travou e ficou pendente de reset (reboot físico obrigatório). Usado pelo Módulo 2, que identifica a GPU (índice, PCI e serial). |
+| `2` | GPU caiu do barramento ou travou e ficou pendente de reset (reboot físico obrigatório). Usado pelo Módulo 2 (inclusive no modo `--health`), que identifica a GPU (índice, PCI e serial). |
 | `3` | Hardware reprovado |
 | `4` | Driver NVIDIA instalado: reboot necessário. Usado pelos Módulos 0 e 1. |
 
@@ -275,6 +290,8 @@ Constantes no início de cada script:
 | Constante | Arquivo | Padrão | Descrição |
 |---|---|---|---|
 | `EXPECTED_GPUS` | 00, 01, 02 | `8` | Quantidade de GPUs esperada |
+| `DCGM_LEVEL` / `DCGM_TRIAGE_LEVEL` | 00 | `4` / `2` | Nível máximo do DCGM e último nível da triagem. Os níveis acima da triagem rodam na etapa de estresse, depois do vLLM; com `DCGM_LEVEL` igual ou menor que a triagem, não há etapa de estresse. |
+| `HEALTH_SMI_TIMEOUT` | 02 | `60` | Tempo máximo, em segundos, de cada consulta ao `nvidia-smi` na verificação de saúde |
 | `EXPECTED_PCIE_GEN` / `EXPECTED_PCIE_WIDTH` | 01 (`GEN` também em 00) | `5` / `16` | Largura PCIe esperada. A geração esperada vem do máximo informado pela própria GPU; `EXPECTED_PCIE_GEN` só é usado se o driver não informar esse máximo. |
 | `DRIVER_PIN` | 01 | vazio | Branch do driver NVIDIA a fixar na instalação automática (vazio = mais recente) |
 | `REBOOT_COUNTDOWN` | 00, 01 | `60` | Segundos de aviso antes do reboot após instalar o driver |

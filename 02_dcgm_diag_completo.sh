@@ -1,11 +1,31 @@
 #!/bin/bash
-# Modulo 2: Diagnostico DCGM Completo (v11 - Gatekeeper de Saude PCIe/Hardware + Execucao como root + Avaliacao do JSON FAIL/WARN + deteccao de driver ausente + identificacao da GPU em falha)
-# Uso: ./02_dcgm_diag_completo.sh [NIVEL_MAXIMO] (Padrao: 4. Ex: ./02_dcgm_diag_completo.sh 2)
+# Modulo 2: Diagnostico DCGM Completo (v12 - Gatekeeper de Saude PCIe/Hardware + Execucao como root + Avaliacao do JSON FAIL/WARN + deteccao de driver ausente + identificacao da GPU em falha + intervalo de niveis + modo --health)
+# Uso: ./02_dcgm_diag_completo.sh [NIVEL_MAXIMO]          niveis 1 ate NIVEL_MAXIMO (padrao: 4). Ex.: ./02_dcgm_diag_completo.sh 2
+#      ./02_dcgm_diag_completo.sh <NIVEL_MIN> <NIVEL_MAX>  intervalo de niveis. Ex.: ./02_dcgm_diag_completo.sh 3 4
+#      ./02_dcgm_diag_completo.sh --health                 apenas verifica a saude das GPUs (sem rodar o DCGM)
 # Codigos de saida: 0 = aprovado | 1 = erro de software/utilitario | 2 = GPU caiu do barramento ou travou/pendente de reset (reboot obrigatorio) | 3 = hardware reprovado no diagnostico
 
-MAX_LEVEL=${1:-4}
 # Quantidade de GPUs que o servidor deve ter (padrao da homologacao)
 EXPECTED_GPUS=8
+# Tempo maximo (s) de cada consulta ao nvidia-smi na verificacao de saude: sem resposta = GPU travada ou driver travado
+HEALTH_SMI_TIMEOUT=60
+
+usage() {
+    echo "Uso: $0 [NIVEL_MAXIMO] | <NIVEL_MIN> <NIVEL_MAX> | --health   (niveis de 1 a 4)"
+    exit 1
+}
+
+MODE="diag"
+if [ "${1:-}" = "--health" ]; then
+    MODE="health"
+elif [ "$#" -ge 2 ]; then
+    MIN_LEVEL="$1"; MAX_LEVEL="$2"
+else
+    MIN_LEVEL=1; MAX_LEVEL="${1:-4}"
+fi
+if [ "$MODE" = "diag" ]; then
+    [[ "$MIN_LEVEL" =~ ^[1-4]$ && "$MAX_LEVEL" =~ ^[1-4]$ ]] && [ "$MIN_LEVEL" -le "$MAX_LEVEL" ] || usage
+fi
 
 # Garante execucao como root: necessario para ler o dmesg (Ubuntu restringe a usuarios comuns)
 # e para nao depender do cache do sudo (~15 min) durante testes longos
@@ -14,7 +34,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # Mantem os arquivos na home do usuario que chamou o script, mesmo rodando como root
-REAL_USER="${SUDO_USER:-$USER}"
+REAL_USER="${SUDO_USER:-${USER:-$(id -un)}}"
 REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
 BASE_DIR="$REAL_HOME/homologacao"
 
@@ -22,7 +42,12 @@ mkdir -p "$BASE_DIR/dcgm"
 # Devolve a posse dos arquivos gerados ao usuario em qualquer saida do script
 trap 'chown -R "$REAL_USER": "$BASE_DIR" 2>/dev/null' EXIT
 
-FULL_LOG="$BASE_DIR/dcgm/diag_execucao_$(date +%Y%m%d_%H%M%S).log"
+# O modo --health grava em um log proprio, para nao se misturar aos logs do diagnostico
+if [ "$MODE" = "health" ]; then
+    FULL_LOG="$BASE_DIR/dcgm/health_$(date +%Y%m%d_%H%M%S).log"
+else
+    FULL_LOG="$BASE_DIR/dcgm/diag_execucao_$(date +%Y%m%d_%H%M%S).log"
+fi
 
 log() {
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$FULL_LOG"
@@ -31,9 +56,10 @@ log() {
 # ==============================================================================
 # Gatekeeper de Hardware: Detecta GPU caida do barramento ou estado de Reboot
 # ==============================================================================
-# Identifica as GPUs marcadas para reset (indice, PCI e serial), usando o inventario do Modulo 1
+# Identifica as GPUs marcadas para reset (indice, PCI e serial), usando o inventario do Modulo 1.
+# Le a saida do "nvidia-smi -q" pela entrada padrao.
 identify_recovery_gpus() {
-    nvidia-smi -q 2>/dev/null | awk -v inv="$BASE_DIR/inventario/pcie_status.txt" '
+    awk -v inv="$BASE_DIR/inventario/pcie_status.txt" '
         BEGIN { while ((getline l < inv) > 0) { split(l, a, /, */); if (a[1] ~ /^[0-9]+$/) idx[tolower(a[3])] = a[1] } }
         /^GPU [0-9A-Fa-f]+:/ { bus = tolower($2); serial = "?" }
         /^    Serial Number/ { s = $0; sub(/.*: */, "", s); serial = s }
@@ -52,10 +78,22 @@ check_gpu_health() {
     # 2. Consulta lista de GPUs ativas no driver
     local smi_list
     local smi_rc=0
-    smi_list=$(nvidia-smi -L 2>&1) || smi_rc=$?
+    smi_list=$(timeout -k 10 "$HEALTH_SMI_TIMEOUT" nvidia-smi -L 2>&1) || smi_rc=$?
 
     local active_count
     active_count=$(echo "$smi_list" | grep -cE "^GPU [0-9]+:" || true)
+
+    # nvidia-smi sem resposta: GPU travada ou driver travado (sem timeout, a verificacao ficaria parada para sempre)
+    if [ "$smi_rc" -eq 124 ] || [ "$smi_rc" -eq 137 ]; then
+        log "======================================================================"
+        log "FALHA CRITICA: NVIDIA-SMI SEM RESPOSTA ($fase)!"
+        log "O nvidia-smi nao respondeu em ${HEALTH_SMI_TIMEOUT}s: GPU travada ou driver NVIDIA travado."
+        log "GPUs no barramento PCIe (lspci): $pci_count"
+        log "ACAO OBRIGATORIA: Execute um REBOOT FISICO (Hard Reboot) no servidor."
+        log "======================================================================"
+        GPU_FAIL_DESC="nvidia-smi sem resposta em ${HEALTH_SMI_TIMEOUT}s (GPU ou driver travado)"
+        return 1
+    fi
 
     if [ "$smi_rc" -ne 0 ] || echo "$smi_list" | grep -qiE "Unknown Error|Unable to determine|fallen off|No devices"; then
         log "======================================================================"
@@ -92,11 +130,21 @@ check_gpu_health() {
     fi
 
     # 3. Verifica se o driver sinalizou necessidade de Reboot (GPU Recovery Action)
-    local recovery_status
-    recovery_status=$(nvidia-smi -q 2>/dev/null | grep "GPU Recovery Action" | grep -v "None" || true)
+    local smi_q q_rc=0 recovery_status
+    smi_q=$(timeout -k 10 "$HEALTH_SMI_TIMEOUT" nvidia-smi -q 2>/dev/null) || q_rc=$?
+    if [ "$q_rc" -eq 124 ] || [ "$q_rc" -eq 137 ]; then
+        log "======================================================================"
+        log "FALHA CRITICA: NVIDIA-SMI SEM RESPOSTA ($fase)!"
+        log "O nvidia-smi -q nao respondeu em ${HEALTH_SMI_TIMEOUT}s: GPU travada ou driver NVIDIA travado."
+        log "ACAO OBRIGATORIA: Execute um REBOOT FISICO (Hard Reboot) no servidor."
+        log "======================================================================"
+        GPU_FAIL_DESC="nvidia-smi -q sem resposta em ${HEALTH_SMI_TIMEOUT}s (GPU ou driver travado)"
+        return 1
+    fi
+    recovery_status=$(echo "$smi_q" | grep "GPU Recovery Action" | grep -v "None" || true)
     if [ -n "$recovery_status" ]; then
         local failed_gpus
-        failed_gpus=$(identify_recovery_gpus)
+        failed_gpus=$(echo "$smi_q" | identify_recovery_gpus)
         log "======================================================================"
         log "FALHA CRITICA: GPU TRAVADA / PENDENTE DE RESET ($fase)!"
         log "O driver NVIDIA marcou GPU(s) para reset (GPU Recovery Action diferente de None):"
@@ -200,8 +248,6 @@ evaluate_dcgm_json() {
     return 0
 }
 
-log "--- Iniciando Diagnostico DCGM Sequencial (Niveis 1 a $MAX_LEVEL) ---"
-
 # Passo 0a: Sem driver nao ha o que diagnosticar (nao confundir com GPU caida do barramento)
 if ! command -v nvidia-smi &> /dev/null; then
     log "ERRO DE SOFTWARE: nvidia-smi nao encontrado - o driver NVIDIA nao esta instalado."
@@ -209,8 +255,20 @@ if ! command -v nvidia-smi &> /dev/null; then
     exit 1
 fi
 
+# Modo --health: apenas a verificacao de saude (usada pelo orquestrador entre as etapas)
+if [ "$MODE" = "health" ]; then
+    if check_gpu_health "Verificacao de saude"; then
+        exit 0
+    fi
+    log "DIAGNOSTICO FINAL: GPU(s) em falha: ${GPU_FAIL_DESC:-estado de GPU degradado}."
+    exit 2
+fi
+
+log "--- Iniciando Diagnostico DCGM Sequencial (Niveis $MIN_LEVEL a $MAX_LEVEL) ---"
+
 # Passo 0b: Verifica se o hardware ja nao esta degradado antes mesmo de tocar no DCGM
 if ! check_gpu_health "Pre-Check Inicial"; then
+    log "DIAGNOSTICO FINAL: GPU(s) ja estavam em falha antes do diagnostico: ${GPU_FAIL_DESC:-estado de GPU degradado}."
     exit 2
 fi
 
@@ -255,13 +313,16 @@ done
 
 if [ "$MOTOR_ONLINE" = false ]; then
     log "ERRO DE SERVICO: O motor nvidia-dcgm nao respondeu. Verificando se houve queda de GPU..."
-    check_gpu_health "Pos-Falha Motor DCGM" || exit 2
+    if ! check_gpu_health "Pos-Falha Motor DCGM"; then
+        log "DIAGNOSTICO FINAL: GPU(s) em falha ao iniciar o motor DCGM: ${GPU_FAIL_DESC:-estado de GPU degradado}."
+        exit 2
+    fi
     exit 1
 fi
 
 # Execucao dos niveis solicitados
 TOTAL_BENIGN=0
-for LEVEL in $(seq 1 "$MAX_LEVEL"); do
+for LEVEL in $(seq "$MIN_LEVEL" "$MAX_LEVEL"); do
     log "=================================================="
     log "Executando Nivel $LEVEL..."
     if [ "$LEVEL" -ge 3 ]; then
@@ -321,4 +382,4 @@ for LEVEL in $(seq 1 "$MAX_LEVEL"); do
 done
 
 log "=================================================="
-log "Todos os niveis solicitados (1 a $MAX_LEVEL) do Diagnostico DCGM foram concluidos com sucesso! Avisos benignos registrados: $TOTAL_BENIGN"
+log "Todos os niveis solicitados ($MIN_LEVEL a $MAX_LEVEL) do Diagnostico DCGM foram concluidos com sucesso! Avisos benignos registrados: $TOTAL_BENIGN"

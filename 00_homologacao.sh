@@ -1,7 +1,9 @@
 #!/bin/bash
-# Modulo 0: Orquestrador da Homologacao (v6 - execucao direto do GitHub + instalacao do driver com reboot + PCIe pelo maximo da GPU + diagnostico de P2P/IOMMU + GPU em falha e consequencias)
-# Executa todos os modulos no fluxo recomendado (mesmo que algum falhe), coleta as metricas e
-# gera o relatorio APROVADO/REPROVADO com um pacote de todos os arquivos da execucao.
+# Modulo 0: Orquestrador da Homologacao (v7 - execucao direto do GitHub + instalacao do driver com reboot + PCIe pelo maximo da GPU + diagnostico de P2P/IOMMU + GPU em falha e consequencias + DCGM em triagem/estresse + linha do tempo)
+# Executa os modulos no fluxo recomendado: inventario, telemetria, DCGM triagem (niveis 1-2), NCCL,
+# vLLM e DCGM estresse (niveis 3-4). Uma falha de teste nao interrompe a bateria; so quando uma GPU
+# entra em falha (travada ou fora do barramento) as etapas seguintes deixam de ser executadas.
+# Ao final gera o relatorio APROVADO/REPROVADO, com linha do tempo, e um pacote de todos os arquivos.
 # Se os modulos 01-05 nao estiverem no mesmo diretorio, baixa-os do repositorio GitHub.
 # Se o driver NVIDIA estiver ausente, o Modulo 1 o instala e o servidor e REINICIADO (com aviso);
 # depois do reboot, basta executar o mesmo comando novamente.
@@ -18,7 +20,8 @@
 # ==============================================================================
 # Configuracao
 # ==============================================================================
-DCGM_LEVEL=4
+DCGM_LEVEL=4                              # nivel maximo do DCGM (a etapa de estresse roda os niveis acima da triagem)
+DCGM_TRIAGE_LEVEL=2                       # niveis 1..N rodam no inicio, como triagem rapida, antes do NCCL e do vLLM
 EXPECTED_GPUS=8
 EXPECTED_PCIE_GEN=5                       # usado so se o driver nao informar a geracao maxima de cada GPU
 MAX_GPU_TEMP_C=90                         # temperatura maxima aceitavel da GPU no burn-in
@@ -72,7 +75,6 @@ touch "$STAMP"
 
 log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$ORCH_LOG"; }
 fmt_dur() { printf '%02d:%02d:%02d' $(($1 / 3600)) $(($1 % 3600 / 60)) $(($1 % 60)); }
-# Arquivo mais recente de um padrao, gerado nesta execucao
 # Identifica uma GPU pelo endereco PCI (ex.: 0000:21:00) usando o inventario coletado no inicio
 gpu_id_from_pci() {
     local key idx serial
@@ -81,6 +83,7 @@ gpu_id_from_pci() {
     serial=$(awk -v k=":$key" 'tolower($0) ~ /^gpu [0-9a-f]+:/ {f = index(tolower($0), k) > 0} f && /^    Serial Number/ {sub(/.*: */, ""); print; exit}' "$BASE_DIR/inventario/nvidia-smi-q.txt" 2>/dev/null)
     echo "GPU ${idx:-?} (PCI $1, serial ${serial:-?})"
 }
+# Arquivo mais recente de um padrao, gerado nesta execucao
 newest() { find "$1" -maxdepth 1 -name "$2" -newer "$STAMP" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -n1 | cut -d' ' -f2-; }
 
 # ==============================================================================
@@ -112,12 +115,15 @@ else
     done
 fi
 
-declare -A ST_STATUS ST_DUR ST_DESC
+declare -A ST_STATUS ST_DUR ST_DESC ST_T0 ST_T1
 STAGES=()
 MOTIVOS=()
 AVISOS=()
-CONSEQ=()          # falhas causadas por uma GPU que ja estava em falha (nao sao problemas independentes)
+CONSEQ=()          # etapas e falhas causadas por uma GPU que ja estava em falha (nao sao problemas independentes)
 GPU_FAILED=false
+FAIL_STAGE=""      # etapa em que a GPU entrou em falha (falha primaria)
+FAIL_EPOCH=""      # quando a falha foi detectada
+FAIL_DESC=""
 START_EPOCH=$(date +%s)
 TELEMETRY_ON=false
 
@@ -128,12 +134,65 @@ run_stage() {
     STAGES+=("$id"); ST_DESC[$id]="$desc"
     log "=================================================="
     log "ETAPA $id: $desc - Iniciada"
-    t0=$(date +%s)
+    t0=$(date +%s); ST_T0[$id]=$t0
     ( cd "$SCRIPT_DIR" && HOME="$REAL_HOME" HF_TOKEN="$HF_TOKEN_ARG" HOMOLOG_ORQUESTRADOR=1 "$@" ) < /dev/null 2>&1 | tee -a "$ORCH_LOG"
     rc=${PIPESTATUS[0]}
-    ST_DUR[$id]=$(($(date +%s) - t0))
+    ST_T1[$id]=$(date +%s)
+    ST_DUR[$id]=$((ST_T1[$id] - t0))
     log "ETAPA $id: $desc - Finalizada (codigo $rc, duracao $(fmt_dur "${ST_DUR[$id]}"))"
     return "$rc"
+}
+
+# Registra a falha primaria de GPU: as etapas seguintes nao sao executadas
+mark_gpu_failure() {
+    GPU_FAILED=true; FAIL_STAGE="$1"; FAIL_DESC="$2"; FAIL_EPOCH=$(date +%s)
+}
+
+# Etapa nao executada porque uma GPU ja estava em falha (evita horas de testes sobre hardware quebrado)
+skip_stage() {
+    local id="$1" desc="$2"
+    STAGES+=("$id"); ST_DESC[$id]="$desc"; ST_STATUS[$id]="NAO EXECUTADO"; ST_DUR[$id]=0
+    CONSEQ+=("$desc: nao executado porque a GPU entrou em falha na etapa $FAIL_STAGE (${ST_DESC[$FAIL_STAGE]}).")
+    log "ETAPA $id: $desc - NAO EXECUTADA (GPU em falha desde a etapa $FAIL_STAGE)"
+}
+
+# Verifica a saude das GPUs depois de uma etapa (Modulo 2 --health). Retorna 1 se uma GPU entrou em falha.
+post_stage_health() {
+    local id="$1" name="$2" out rc diag
+    log "Verificando a saude das GPUs apos a etapa $id..."
+    out=$(cd "$SCRIPT_DIR" && HOME="$REAL_HOME" ./02_dcgm_diag_completo.sh --health 2>&1 < /dev/null); rc=$?
+    echo "$out" | tee -a "$ORCH_LOG" >/dev/null
+    case "$rc" in
+        0) log "GPUs saudaveis apos a etapa $id."; return 0 ;;
+        2) diag=$(echo "$out" | grep -m1 -oE "DIAGNOSTICO FINAL: .*" | sed -E 's/^DIAGNOSTICO FINAL: GPU\(s\) em falha: //; s/\.$//')
+           echo "$out" | grep -E "FALHA CRITICA|GPU EM FALHA|DIAGNOSTICO FINAL" | sed -E 's/^\[[^]]*\] //' | while IFS= read -r l; do log "  $l"; done
+           ST_STATUS[$id]="REPROVADO"
+           MOTIVOS+=("$name: GPU entrou em falha durante a etapa: ${diag:-estado de GPU degradado} (reboot obrigatorio).")
+           mark_gpu_failure "$id" "${diag:-estado de GPU degradado}"
+           return 1 ;;
+        *) AVISOS+=("$name: nao foi possivel verificar a saude das GPUs apos a etapa (codigo $rc).")
+           return 0 ;;
+    esac
+}
+
+# Avalia o resultado de uma execucao do Modulo 2 (triagem ou estresse)
+eval_dcgm() {
+    local id="$1" rc="$2" dlog="$3" name="$4" diag p2p iommu
+    case "$rc" in
+        0) ST_STATUS[$id]="APROVADO" ;;
+        2) ST_STATUS[$id]="REPROVADO"
+           diag=$(grep -m1 -oE "DIAGNOSTICO FINAL: .*" "$dlog" 2>/dev/null | sed 's/^DIAGNOSTICO FINAL: //; s/\.$//')
+           MOTIVOS+=("$name: ${diag:-GPU caiu do barramento ou ficou pendente de reset} (codigo 2; reboot obrigatorio).")
+           mark_gpu_failure "$id" "${diag:-GPU caiu do barramento ou ficou pendente de reset}" ;;
+        3) ST_STATUS[$id]="REPROVADO"; MOTIVOS+=("$name: hardware reprovado no diagnostico (codigo 3). Detalhes na secao DCGM.")
+           # Falhas de P2P costumam vir da plataforma (IOMMU/ACS), nao de uma GPU com defeito
+           p2p=$(grep -cE "\[FAIL\] Teste: pcie .*peer-to-peer" "$dlog" 2>/dev/null)
+           if [ "${p2p:-0}" -gt 0 ]; then
+               iommu=$(grep -m1 -oE "IOMMU: [^|]+" "$INV_LOG" 2>/dev/null | sed 's/ *$//')
+               MOTIVOS+=("$name: $p2p falha(s) de P2P (dados corrompidos entre GPUs). Causa mais comum: IOMMU em modo de traducao ou ACS, nao uma GPU com defeito (${iommu:-IOMMU: nao verificado}). Recomendacao: iommu=pt no kernel ou IOMMU desligado na BIOS; depois validar com 'sudo dcgmi diag -r pcie'.")
+           fi ;;
+        *) ST_STATUS[$id]="FALHOU"; MOTIVOS+=("$name: erro de software/utilitario (codigo $rc); diagnostico incompleto.") ;;
+    esac
 }
 
 stop_telemetry() {
@@ -224,71 +283,85 @@ else
 fi
 
 # ==============================================================================
-# Etapa 3: Diagnostico DCGM
+# Etapa 3: DCGM triagem (niveis rapidos; aponta GPU ja defeituosa antes dos testes de carga)
 # ==============================================================================
-run_stage 3 "Diagnostico DCGM (niveis 1 a $DCGM_LEVEL)" ./02_dcgm_diag_completo.sh "$DCGM_LEVEL"
+TRI_MAX=$(( DCGM_LEVEL < DCGM_TRIAGE_LEVEL ? DCGM_LEVEL : DCGM_TRIAGE_LEVEL ))
+run_stage 3 "DCGM triagem (niveis 1 a $TRI_MAX)" ./02_dcgm_diag_completo.sh 1 "$TRI_MAX"
 RC=$?
-DCGM_LOG=$(newest "$BASE_DIR/dcgm" "diag_execucao_*.log")
-case "$RC" in
-    0) ST_STATUS[3]="APROVADO" ;;
-    2) ST_STATUS[3]="REPROVADO"; GPU_FAILED=true
-       DCGM_DIAG=$(grep -m1 -oE "DIAGNOSTICO FINAL: .*" "$DCGM_LOG" 2>/dev/null | sed 's/^DIAGNOSTICO FINAL: //')
-       MOTIVOS+=("DCGM: ${DCGM_DIAG:-GPU caiu do barramento ou ficou pendente de reset} (codigo 2; reboot obrigatorio).") ;;
-    3) ST_STATUS[3]="REPROVADO"; MOTIVOS+=("DCGM: hardware reprovado no diagnostico (codigo 3). Detalhes na secao DCGM.")
-       # Falhas de P2P costumam vir da plataforma (IOMMU/ACS), nao de uma GPU com defeito
-       P2P_FAILS=$(grep -cE "\[FAIL\] Teste: pcie .*peer-to-peer" "$DCGM_LOG" 2>/dev/null)
-       if [ "${P2P_FAILS:-0}" -gt 0 ]; then
-           IOMMU_INFO=$(grep -m1 -oE "IOMMU: [^|]+" "$INV_LOG" 2>/dev/null | sed 's/ *$//')
-           MOTIVOS+=("DCGM: $P2P_FAILS falha(s) de P2P (dados corrompidos entre GPUs). Causa mais comum: IOMMU em modo de traducao ou ACS, nao uma GPU com defeito (${IOMMU_INFO:-IOMMU: nao verificado}). Recomendacao: iommu=pt no kernel ou IOMMU desligado na BIOS; depois validar com 'sudo dcgmi diag -r pcie'.")
-       fi ;;
-    *) ST_STATUS[3]="FALHOU";    MOTIVOS+=("DCGM: erro de software/utilitario (codigo $RC); diagnostico incompleto.") ;;
-esac
+DCGM_LOG_T=$(newest "$BASE_DIR/dcgm" "diag_execucao_*.log")
+eval_dcgm 3 "$RC" "$DCGM_LOG_T" "DCGM triagem"
 
 # ==============================================================================
 # Etapa 4: NCCL
 # ==============================================================================
-run_stage 4 "Teste NCCL (AllReduce, com e sem P2P)" ./03_nccl_test.sh
-RC=$?
-NCCL_SUM="$BASE_DIR/benchmark/nccl_resumo.txt"
-[ "$NCCL_SUM" -nt "$STAMP" ] || NCCL_SUM=""
-case "$RC" in
-    0) ST_STATUS[4]="APROVADO" ;;
-    3) ST_STATUS[4]="REPROVADO"
-       while IFS= read -r a; do MOTIVOS+=("NCCL: ${a#  - }"); done < <(grep "^  - " "${NCCL_SUM:-/dev/null}") ;;
-    *) if [ "$GPU_FAILED" = true ]; then
-           ST_STATUS[4]="AFETADO"; CONSEQ+=("NCCL: falhou (codigo $RC) porque uma GPU ja estava em falha desde o DCGM.")
-       else
-           ST_STATUS[4]="FALHOU"; MOTIVOS+=("NCCL: erro de execucao (codigo $RC); teste incompleto.")
-       fi ;;
-esac
+NCCL_SUM=""
+if [ "$GPU_FAILED" = true ]; then
+    skip_stage 4 "Teste NCCL (AllReduce, com e sem P2P)"
+else
+    NCCL_ERR=""
+    run_stage 4 "Teste NCCL (AllReduce, com e sem P2P)" ./03_nccl_test.sh
+    RC=$?
+    NCCL_SUM="$BASE_DIR/benchmark/nccl_resumo.txt"
+    [ "$NCCL_SUM" -nt "$STAMP" ] || NCCL_SUM=""
+    case "$RC" in
+        0) ST_STATUS[4]="APROVADO" ;;
+        3) ST_STATUS[4]="REPROVADO"
+           while IFS= read -r a; do MOTIVOS+=("NCCL: ${a#  - }"); done < <(grep "^  - " "${NCCL_SUM:-/dev/null}") ;;
+        *) ST_STATUS[4]="FALHOU"; NCCL_ERR="NCCL: erro de execucao (codigo $RC); teste incompleto." ;;
+    esac
+    # Se uma GPU travou durante o NCCL, a falha primaria e esta etapa (e nao um erro de execucao)
+    if post_stage_health 4 "NCCL"; then
+        [ -n "${NCCL_ERR:-}" ] && MOTIVOS+=("$NCCL_ERR")
+    fi
+fi
 
 # ==============================================================================
 # Etapa 5: Benchmark vLLM
 # ==============================================================================
-run_stage 5 "Benchmark de inferencia vLLM" ./05_vllm_benchmark.sh
-RC=$?
-VLLM_SUM=$(newest "$BASE_DIR/benchmark" "vllm_resumo_*.txt")
-if [ "$RC" -eq 0 ]; then
-    ST_STATUS[5]="APROVADO"
+VLLM_SUM=""
+if [ "$GPU_FAILED" = true ]; then
+    skip_stage 5 "Benchmark de inferencia vLLM"
 else
-    if [ "$GPU_FAILED" = true ]; then
-        ST_STATUS[5]="AFETADO"; CONSEQ+=("vLLM: falhou (codigo $RC) porque uma GPU ja estava em falha desde o DCGM.")
+    run_stage 5 "Benchmark de inferencia vLLM" ./05_vllm_benchmark.sh
+    RC=$?
+    VLLM_SUM=$(newest "$BASE_DIR/benchmark" "vllm_resumo_*.txt")
+    if [ "$RC" -eq 0 ]; then
+        ST_STATUS[5]="APROVADO"
     else
-        ST_STATUS[5]="FALHOU"; MOTIVOS+=("vLLM: o benchmark falhou (codigo $RC). Ver log completo em $BASE_DIR/logs.")
+        ST_STATUS[5]="FALHOU"
+    fi
+    if post_stage_health 5 "vLLM" && [ "$RC" -ne 0 ]; then
+        MOTIVOS+=("vLLM: o benchmark falhou (codigo $RC). Ver log completo em $BASE_DIR/logs.")
     fi
 fi
 VLLM_TPUT=$(grep -i "Throughput" "${VLLM_SUM:-/dev/null}" 2>/dev/null | tail -n1 | sed 's/^ *//')
 
 # ==============================================================================
-# Etapa 6: Telemetria (fim) e analise do burn-in
+# Etapa 6: DCGM estresse (niveis longos; os que mais derrubam GPUs instaveis)
+# ==============================================================================
+DCGM_LOG_S=""
+if [ "$DCGM_LEVEL" -gt "$TRI_MAX" ]; then
+    if [ "$GPU_FAILED" = true ]; then
+        skip_stage 6 "DCGM estresse (niveis $((TRI_MAX + 1)) a $DCGM_LEVEL)"
+    else
+        run_stage 6 "DCGM estresse (niveis $((TRI_MAX + 1)) a $DCGM_LEVEL)" ./02_dcgm_diag_completo.sh "$((TRI_MAX + 1))" "$DCGM_LEVEL"
+        RC=$?
+        DCGM_LOG_S=$(newest "$BASE_DIR/dcgm" "diag_execucao_*.log")
+        [ "$DCGM_LOG_S" = "$DCGM_LOG_T" ] && DCGM_LOG_S=""
+        eval_dcgm 6 "$RC" "$DCGM_LOG_S" "DCGM estresse"
+    fi
+fi
+
+# ==============================================================================
+# Etapa 7: Telemetria (fim) e analise do burn-in
 # ==============================================================================
 if [ "$TELEMETRY_ON" = true ]; then
-    STAGES+=(6); ST_DESC[6]="Telemetria (fim) e analise do burn-in"
+    STAGES+=(7); ST_DESC[7]="Telemetria (fim) e analise do burn-in"
     log "=================================================="
-    log "ETAPA 6: ${ST_DESC[6]}"
+    log "ETAPA 7: ${ST_DESC[7]}"
+    ST_T0[7]=$(date +%s)
     stop_telemetry
-    ST_DUR[6]=0
-    ST_STATUS[6]="APROVADO"
+    ST_STATUS[7]="APROVADO"
 
     # Uma linha por GPU: gpu tmax tmem n_amostras n_term n_hwslow n_brake n_swpower gen_max_carga n_carga ecc_max
     TEL_TABLE=$(awk -F', *' -v load="$LOAD_UTIL_PCT" '
@@ -322,7 +395,7 @@ if [ "$TELEMETRY_ON" = true ]; then
     ' "$TEL_CSV" 2>/dev/null | sort -n)
 
     if [ -z "$TEL_TABLE" ]; then
-        ST_STATUS[6]="FALHOU"; MOTIVOS+=("Telemetria: nenhuma amostra coletada; burn-in nao verificado.")
+        ST_STATUS[7]="FALHOU"; MOTIVOS+=("Telemetria: nenhuma amostra coletada; burn-in nao verificado.")
     fi
     # Geracao PCIe maxima suportada por cada GPU (ex.: L40S = Gen4, Blackwell = Gen5).
     # Vem do inventario, coletado com as GPUs saudaveis; a consulta ao vivo so e usada se faltar.
@@ -340,50 +413,135 @@ if [ "$TELEMETRY_ON" = true ]; then
         [ -z "$g" ] && continue
         TEL_GPUS=$((TEL_GPUS + 1))
         if [ "$tmax" != "NA" ] && awk -v t="$tmax" -v m="$MAX_GPU_TEMP_C" 'BEGIN { exit !(t > m) }'; then
-            ST_STATUS[6]="REPROVADO"; MOTIVOS+=("Telemetria: GPU $g atingiu ${tmax} C (maximo aceitavel: $MAX_GPU_TEMP_C C).")
+            ST_STATUS[7]="REPROVADO"; MOTIVOS+=("Telemetria: GPU $g atingiu ${tmax} C (maximo aceitavel: $MAX_GPU_TEMP_C C).")
         fi
         if [ "$nterm" -gt 0 ]; then
-            ST_STATUS[6]="REPROVADO"; MOTIVOS+=("Telemetria: GPU $g com throttling termico em $nterm amostra(s).")
+            ST_STATUS[7]="REPROVADO"; MOTIVOS+=("Telemetria: GPU $g com throttling termico em $nterm amostra(s).")
         fi
         if [ "$nhws" -gt 0 ] || [ "$nbrk" -gt 0 ]; then
-            ST_STATUS[6]="REPROVADO"; MOTIVOS+=("Telemetria: GPU $g com HW Slowdown/Power Brake em $((nhws + nbrk)) amostra(s) (energia ou sinal de hardware).")
+            ST_STATUS[7]="REPROVADO"; MOTIVOS+=("Telemetria: GPU $g com HW Slowdown/Power Brake em $((nhws + nbrk)) amostra(s) (energia ou sinal de hardware).")
         fi
         if [ "$nload" -eq 0 ] || [ "$genmax" = "NA" ]; then
             AVISOS+=("Telemetria: GPU $g sem amostras sob carga (>= ${LOAD_UTIL_PCT}% de uso); geracao PCIe sob carga nao verificada.")
         elif [ "$genmax" -lt "${GPU_GEN_MAX[$g]:-$EXPECTED_PCIE_GEN}" ]; then
-            ST_STATUS[6]="REPROVADO"; MOTIVOS+=("Telemetria: GPU $g nao passou de PCIe Gen$genmax sob carga (esperado Gen${GPU_GEN_MAX[$g]:-$EXPECTED_PCIE_GEN}).")
+            ST_STATUS[7]="REPROVADO"; MOTIVOS+=("Telemetria: GPU $g nao passou de PCIe Gen$genmax sob carga (esperado Gen${GPU_GEN_MAX[$g]:-$EXPECTED_PCIE_GEN}).")
         fi
         if [ "$eccmax" != "NA" ] && [ "$eccmax" -gt 0 ]; then
-            ST_STATUS[6]="REPROVADO"; MOTIVOS+=("Telemetria: GPU $g com $eccmax erro(s) ECC nao corrigido(s).")
+            ST_STATUS[7]="REPROVADO"; MOTIVOS+=("Telemetria: GPU $g com $eccmax erro(s) ECC nao corrigido(s).")
         fi
     done <<< "$TEL_TABLE"
     if [ -n "$TEL_TABLE" ] && [ "$TEL_GPUS" -lt "$EXPECTED_GPUS" ]; then
-        ST_STATUS[6]="REPROVADO"; MOTIVOS+=("Telemetria: apenas $TEL_GPUS de $EXPECTED_GPUS GPUs apareceram nas amostras.")
+        ST_STATUS[7]="REPROVADO"; MOTIVOS+=("Telemetria: apenas $TEL_GPUS de $EXPECTED_GPUS GPUs apareceram nas amostras.")
     fi
 
     # Log do kernel (o coletor le o buffer desde o boot: inclui eventos anteriores aos testes)
     XID_SUMMARY=$(grep -v '\[telemetria\]' "$TEL_KLOG" 2>/dev/null | grep -oE "Xid \([^)]*\): [0-9]+" | awk '{print $NF}' | sort -n | uniq -c | awk '{printf "Xid %s (%sx)  ", $2, $1}')
-    # Cada Xid e identificado pela GPU (indice, PCI e serial) em que ocorreu
-    while read -r x xpci; do
+    # ------------------------------------------------------------------
+    # Linha do tempo: cada evento do kernel e da telemetria e associado a etapa
+    # (e ao nivel do DCGM) em que ocorreu, para separar causa e consequencia
+    # ------------------------------------------------------------------
+    # Inicio de cada nivel do DCGM ("epoch nivel"), lido dos logs do Modulo 2
+    DCGM_LEVEL_STARTS=$(for f in "$DCGM_LOG_T" "$DCGM_LOG_S"; do [ -n "$f" ] && grep -oE "^\[[0-9-]+ [0-9:]+\] Executando Nivel [0-9]+" "$f" 2>/dev/null; done \
+        | sed -E 's/^\[([^]]+)\] Executando Nivel ([0-9]+)$/\1|\2/' \
+        | while IFS='|' read -r t l; do e=$(date -d "$t" +%s 2>/dev/null) && echo "$e $l"; done | sort -n)
+    # Rotulo da etapa em que um instante (epoch) caiu
+    stage_at() {
+        local e="$1" id lvl
+        if [ "$e" -lt "$START_EPOCH" ]; then echo "antes do inicio da homologacao"; return; fi
+        for id in "${STAGES[@]}"; do
+            [ -n "${ST_T0[$id]:-}" ] || continue
+            if [ "$e" -ge "${ST_T0[$id]}" ] && [ "$e" -le "${ST_T1[$id]}" ]; then
+                lvl=""
+                if [ "$id" = 3 ] || [ "$id" = 6 ]; then
+                    lvl=$(echo "$DCGM_LEVEL_STARTS" | awk -v e="$e" '$1 != "" && $1 <= e {l = $2} END {print l}')
+                fi
+                echo "etapa $id, ${ST_DESC[$id]}${lvl:+, nivel $lvl}"; return
+            fi
+        done
+        echo "entre etapas"
+    }
+    fmt_ts() { date -d "@$1" '+%Y-%m-%d %H:%M:%S'; }
+    TIMELINE=""
+
+    # Xids: uma linha por "epoch|xid|pci|ocorrencias|etapa" (agrupadas por segundo, para nao travar com tempestades de Xid)
+    XID_ROWS=""
+    while read -r cnt rest; do
+        IFS='|' read -r t x xpci <<< "$rest"
+        e=$(date -d "$t" +%s 2>/dev/null) || continue
+        XID_ROWS+="$e|$x|$xpci|$cnt|$(stage_at "$e")"$'\n'
+    done < <(grep -v '\[telemetria\]' "$TEL_KLOG" 2>/dev/null \
+        | sed -nE 's/^\[([^]]+)\] .*Xid \(PCI:([0-9A-Fa-f:.]+)\): ([0-9]+).*/\1|\3|\2/p' | sort | uniq -c)
+    # Por Xid e GPU: total, primeira ocorrencia e etapas em que apareceu
+    XID_GROUPS=$(printf '%s' "$XID_ROWS" | sort -t'|' -k1,1n | awk -F'|' '
+        $1 != "" { k = $2 "|" $3
+          if (!(k in first)) { first[k] = $1; ord[++n] = k }
+          tot[k] += $4
+          if (index(";" st[k] ";", ";" $5 ";") == 0) st[k] = st[k] (st[k] == "" ? "" : ";") $5 }
+        END { for (i = 1; i <= n; i++) { k = ord[i]; print k "|" tot[k] "|" first[k] "|" st[k] } }')
+    # Cada Xid e identificado pela GPU (indice, PCI e serial), com horario e etapa
+    while IFS='|' read -r x xpci tot first sts; do
         [ -z "$x" ] && continue
+        detail="$tot ocorrencia(s), primeira em $(fmt_ts "$first"), durante: ${sts//;/ | }"
         if [[ " $CRITICAL_XIDS " == *" $x "* ]]; then
-            ST_STATUS[6]="REPROVADO"; MOTIVOS+=("Kernel: Xid critico $x na $(gpu_id_from_pci "$xpci") (ver log do kernel).")
+            ST_STATUS[7]="REPROVADO"; MOTIVOS+=("Kernel: Xid critico $x na $(gpu_id_from_pci "$xpci"): $detail.")
         else
-            AVISOS+=("Kernel: Xid $x na $(gpu_id_from_pci "$xpci") (nao critico; pode ter sido causado por aplicacao).")
+            AVISOS+=("Kernel: Xid $x na $(gpu_id_from_pci "$xpci") (nao critico; pode ter sido causado por aplicacao): $detail.")
         fi
-    done < <(grep -v '\[telemetria\]' "$TEL_KLOG" 2>/dev/null | grep -oE "Xid \(PCI:[0-9A-Fa-f:.]+\): [0-9]+" | sed -E 's/^Xid \(PCI:([^)]*)\): ([0-9]+)$/\2 \1/' | sort -u)
+    done <<< "$XID_GROUPS"
+    # Linha do tempo: primeira ocorrencia de cada Xid/GPU em cada etapa
+    while IFS='|' read -r e x xpci cnt st; do
+        [ -z "$e" ] && continue
+        TIMELINE+="$e|Xid $x na $(gpu_id_from_pci "$xpci") (${cnt}x) - $st"$'\n'
+    done < <(printf '%s' "$XID_ROWS" | sort -t'|' -k1,1n | awk -F'|' '
+        $1 != "" { k = $2 "|" $3 "|" $5; if (!(k in f)) { f[k] = $1; ord[++n] = k } c[k] += $4 }
+        END { for (i = 1; i <= n; i++) { k = ord[i]; split(k, a, "|"); print f[k] "|" a[1] "|" a[2] "|" c[k] "|" a[3] } }')
+
+    FALLEN_TS=$(grep -v '\[telemetria\]' "$TEL_KLOG" 2>/dev/null | grep -i "fallen off the bus" | head -n1 | sed -nE 's/^\[([^]]+)\].*/\1/p')
     if grep -v '\[telemetria\]' "$TEL_KLOG" 2>/dev/null | grep -qi "fallen off the bus"; then
-        ST_STATUS[6]="REPROVADO"; MOTIVOS+=("Kernel: GPU caiu do barramento (\"fallen off the bus\").")
-    fi
-    NSMI_HANGS=$(grep -c "\[telemetria\] ALERTA: nvidia-smi" "$TEL_KLOG" 2>/dev/null)
-    if [ "${NSMI_HANGS:-0}" -gt 0 ]; then
-        if [ "$GPU_FAILED" = true ]; then
-            CONSEQ+=("Telemetria: nvidia-smi deixou de responder $NSMI_HANGS vez(es), efeito da GPU em falha.")
+        FALLEN_E=$(date -d "$FALLEN_TS" +%s 2>/dev/null)
+        if [ -n "$FALLEN_E" ]; then
+            ST_STATUS[7]="REPROVADO"; MOTIVOS+=("Kernel: GPU caiu do barramento (\"fallen off the bus\"), primeira em $(fmt_ts "$FALLEN_E"), durante: $(stage_at "$FALLEN_E").")
+            TIMELINE+="$FALLEN_E|GPU caiu do barramento (fallen off the bus) - $(stage_at "$FALLEN_E")"$'\n'
         else
-            ST_STATUS[6]="REPROVADO"; MOTIVOS+=("Telemetria: nvidia-smi deixou de responder $NSMI_HANGS vez(es) (GPU travada ou caida).")
+            ST_STATUS[7]="REPROVADO"; MOTIVOS+=("Kernel: GPU caiu do barramento (\"fallen off the bus\").")
         fi
     fi
-    log "ETAPA 6: ${ST_DESC[6]} - Finalizada (${ST_STATUS[6]})"
+
+    # nvidia-smi sem resposta na telemetria: antes da falha primaria e sinal precoce; depois, consequencia
+    HANG_ROWS=$(grep -oE "^\[[0-9-]+ [0-9:]+\] \[telemetria\] ALERTA: nvidia-smi" "$TEL_KLOG" 2>/dev/null \
+        | sed -E 's/^\[([^]]+)\].*/\1/' | while read -r t; do date -d "$t" +%s 2>/dev/null; done)
+    NSMI_HANGS=$(printf '%s' "$HANG_ROWS" | grep -c . )
+    if [ "${NSMI_HANGS:-0}" -gt 0 ]; then
+        FAIL_T0="${ST_T0[$FAIL_STAGE]:-${FAIL_EPOCH:-}}"
+        H_BEFORE=0; H_AFTER=0; H_FIRST_BEFORE=""; H_FIRST_AFTER=""
+        while read -r e; do
+            [ -z "$e" ] && continue
+            if [ "$GPU_FAILED" = true ] && [ -n "$FAIL_T0" ] && [ "$e" -ge "$FAIL_T0" ]; then
+                H_AFTER=$((H_AFTER + 1)); [ -z "$H_FIRST_AFTER" ] && H_FIRST_AFTER="$e"
+            else
+                H_BEFORE=$((H_BEFORE + 1)); [ -z "$H_FIRST_BEFORE" ] && H_FIRST_BEFORE="$e"
+            fi
+        done <<< "$HANG_ROWS"
+        if [ "$H_BEFORE" -gt 0 ]; then
+            ST_STATUS[7]="REPROVADO"
+            if [ "$GPU_FAILED" = true ]; then
+                MOTIVOS+=("Telemetria: nvidia-smi deixou de responder $H_BEFORE vez(es) antes da falha da GPU (sinal precoce), a primeira em $(fmt_ts "$H_FIRST_BEFORE"), durante: $(stage_at "$H_FIRST_BEFORE").")
+            else
+                MOTIVOS+=("Telemetria: nvidia-smi deixou de responder $H_BEFORE vez(es) (GPU travada ou caida), a primeira em $(fmt_ts "$H_FIRST_BEFORE"), durante: $(stage_at "$H_FIRST_BEFORE").")
+            fi
+        fi
+        if [ "$H_AFTER" -gt 0 ]; then
+            CONSEQ+=("Telemetria: nvidia-smi deixou de responder $H_AFTER vez(es) a partir de $(fmt_ts "$H_FIRST_AFTER"), efeito da GPU em falha.")
+        fi
+        # Linha do tempo: primeira falta de resposta e quantidade em cada etapa
+        while IFS='|' read -r e cnt st; do
+            [ -z "$e" ] && continue
+            TIMELINE+="$e|nvidia-smi sem resposta na telemetria (${cnt}x) - $st"$'\n'
+        done < <(while read -r e; do [ -n "$e" ] && echo "$e|$(stage_at "$e")"; done <<< "$HANG_ROWS" \
+            | awk -F'|' '{ if (!($2 in f)) { f[$2] = $1; ord[++n] = $2 } c[$2]++ } END { for (i = 1; i <= n; i++) print f[ord[i]] "|" c[ord[i]] "|" ord[i] }')
+    fi
+    ST_T1[7]=$(date +%s); ST_DUR[7]=$((ST_T1[7] - ST_T0[7]))
+    log "ETAPA 7: ${ST_DESC[7]} - Finalizada (${ST_STATUS[7]})"
 fi
 
 # ==============================================================================
@@ -391,6 +549,9 @@ fi
 # ==============================================================================
 END_EPOCH=$(date +%s)
 if [ "${#MOTIVOS[@]}" -eq 0 ]; then VERDICT="APROVADO"; else VERDICT="REPROVADO"; fi
+if [ "$GPU_FAILED" = true ]; then
+    TIMELINE+="$FAIL_EPOCH|FALHA PRIMARIA detectada ao fim da etapa $FAIL_STAGE (${ST_DESC[$FAIL_STAGE]}): $FAIL_DESC"$'\n'
+fi
 
 SYS_VENDOR=$(dmidecode -s system-manufacturer 2>/dev/null | head -n1)
 SYS_MODEL=$(dmidecode -s system-product-name 2>/dev/null | head -n1)
@@ -433,32 +594,61 @@ NCCLT_COMMIT=$(grep -m1 "nccl-tests: commit" "${NCCL_SUM:-/dev/null}" 2>/dev/nul
     echo "ETAPAS"
     echo "------------------------------------------------------------------"
     for id in "${STAGES[@]}"; do
-        printf "  [%-9s] %s. %-45s %s\n" "${ST_STATUS[$id]:-?}" "$id" "${ST_DESC[$id]}" "$(fmt_dur "${ST_DUR[$id]:-0}")"
+        printf "  [%-13s] %s. %-45s %s\n" "${ST_STATUS[$id]:-?}" "$id" "${ST_DESC[$id]}" "$(fmt_dur "${ST_DUR[$id]:-0}")"
     done
+    echo ""
+    echo "------------------------------------------------------------------"
+    echo "LINHA DO TEMPO"
+    echo "------------------------------------------------------------------"
+    echo "  Etapas:"
+    for id in "${STAGES[@]}"; do
+        if [ -n "${ST_T0[$id]:-}" ]; then
+            printf "    %s - %s  %s. %s\n" "$(date -d "@${ST_T0[$id]}" '+%Y-%m-%d %H:%M:%S')" "$(date -d "@${ST_T1[$id]}" '+%H:%M:%S')" "$id" "${ST_DESC[$id]}"
+        else
+            printf "    %-31s  %s. %s\n" "(${ST_STATUS[$id]:-nao executada})" "$id" "${ST_DESC[$id]}"
+        fi
+    done
+    if [ -n "$TIMELINE" ]; then
+        echo "  Eventos (horario do primeiro registro em cada etapa):"
+        printf '%s' "$TIMELINE" | sort -t'|' -k1,1n | while IFS='|' read -r e txt; do
+            [ -n "$e" ] && printf "    %s  %s\n" "$(date -d "@$e" '+%Y-%m-%d %H:%M:%S')" "$txt"
+        done
+    else
+        echo "  Eventos: nenhum Xid, falta de resposta do nvidia-smi ou falha de GPU registrados."
+    fi
     echo ""
     echo "------------------------------------------------------------------"
     echo "HARDWARE (Modulo 1)"
     echo "------------------------------------------------------------------"
     grep -E "GPUs esperadas:|GPU [0-9]+ \(.*\): (OK|FALHA|ERRO)|Validacao de GPUs dentro do container|IOMMU: |AVISO DE PLATAFORMA|STATUS DO HARDWARE|ALERTA CRITICO" "$INV_LOG" 2>/dev/null | sed -E 's/^\[[^]]*\] /  /'
     echo ""
-    echo "------------------------------------------------------------------"
-    echo "DIAGNOSTICO DCGM (Modulo 2, nivel $DCGM_LEVEL)"
-    echo "------------------------------------------------------------------"
-    if [ -n "$DCGM_LOG" ]; then
-        grep -E "\[FAIL\]|\[WARN |Motivacao:|REPROVADO|DIAGNOSTICO FINAL|concluido com sucesso|concluidos com sucesso|FALHA CRITICA|GPU EM FALHA" "$DCGM_LOG" | sed -E 's/^\[[^]]*\] /  /'
-    else
-        echo "  (log do diagnostico nao encontrado)"
-    fi
-    echo ""
+    for dsec in 3 6; do
+        [ -n "${ST_DESC[$dsec]:-}" ] || continue
+        [ "$dsec" = 3 ] && dlog="$DCGM_LOG_T" || dlog="$DCGM_LOG_S"
+        echo "------------------------------------------------------------------"
+        echo "DIAGNOSTICO ${ST_DESC[$dsec]} (Modulo 2)"
+        echo "------------------------------------------------------------------"
+        if [ -n "$dlog" ]; then
+            grep -E "\[FAIL\]|\[WARN |Motivacao:|REPROVADO|DIAGNOSTICO FINAL|concluido com sucesso|concluidos com sucesso|FALHA CRITICA|GPU EM FALHA" "$dlog" | sed -E 's/^\[[^]]*\] /  /'
+        elif [ "${ST_STATUS[$dsec]}" = "NAO EXECUTADO" ]; then
+            echo "  (nao executado: GPU em falha desde a etapa $FAIL_STAGE)"
+        else
+            echo "  (log do diagnostico nao encontrado)"
+        fi
+        echo ""
+    done
     echo "------------------------------------------------------------------"
     echo "NCCL (Modulo 3)"
     echo "------------------------------------------------------------------"
-    if [ -n "$NCCL_SUM" ]; then grep -v "^=====" "$NCCL_SUM" | sed 's/^/  /'; else echo "  (resumo do NCCL nao encontrado)"; fi
+    if [ -n "$NCCL_SUM" ]; then grep -v "^=====" "$NCCL_SUM" | sed 's/^/  /'
+    elif [ "${ST_STATUS[4]}" = "NAO EXECUTADO" ]; then echo "  (nao executado: GPU em falha desde a etapa $FAIL_STAGE)"
+    else echo "  (resumo do NCCL nao encontrado)"; fi
     echo ""
     echo "------------------------------------------------------------------"
     echo "INFERENCIA vLLM (Modulo 5) - throughput apenas registrado"
     echo "------------------------------------------------------------------"
-    echo "  ${VLLM_TPUT:-(throughput nao encontrado)}"
+    if [ "${ST_STATUS[5]}" = "NAO EXECUTADO" ]; then echo "  (nao executado: GPU em falha desde a etapa $FAIL_STAGE)"
+    else echo "  ${VLLM_TPUT:-(throughput nao encontrado)}"; fi
     echo ""
     echo "------------------------------------------------------------------"
     echo "TELEMETRIA DO BURN-IN (Modulo 4) - limite: ${MAX_GPU_TEMP_C} C"
